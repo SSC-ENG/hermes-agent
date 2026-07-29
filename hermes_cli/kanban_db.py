@@ -435,6 +435,39 @@ def current_board_path() -> Path:
     return kanban_home() / "kanban" / "current"
 
 
+def dispatcher_health_path() -> Path:
+    """Return the machine-readable embedded-dispatcher health file path."""
+    return kanban_home() / "kanban" / "dispatcher-health.json"
+
+
+def read_dispatcher_health() -> Optional[dict[str, Any]]:
+    """Read the last persisted dispatcher health snapshot, if valid."""
+    path = dispatcher_health_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def write_dispatcher_health(payload: Mapping[str, Any]) -> None:
+    """Atomically persist the embedded dispatcher's latest health snapshot."""
+    path = dispatcher_health_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(dict(payload), sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def get_current_board() -> str:
     """Return the active board slug, honouring the resolution chain.
 
@@ -8052,6 +8085,82 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         if profile_exists(row["assignee"]):
             return True
     return False
+
+
+def dispatcher_capacity_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> dict[str, Any]:
+    """Describe spawnable work while honoring dispatcher guardrails."""
+    running_count = int(
+        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+    )
+    caps = [
+        cap for cap in (max_spawn, max_in_progress)
+        if isinstance(cap, int) and cap > 0
+    ]
+    global_cap = min(caps) if caps else None
+    free_global_slots = (
+        None if global_cap is None else max(0, global_cap - running_count)
+    )
+    snapshot: dict[str, Any] = {
+        "running_count": running_count,
+        "global_cap": global_cap,
+        "free_global_slots": free_global_slots,
+        "dispatchable_count": 0,
+        "dispatchable_task_ids": [],
+    }
+    if free_global_slots == 0:
+        return snapshot
+
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+    per_profile_cap = (
+        max_in_progress_per_profile
+        if isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+        else None
+    )
+    per_profile_running: dict[str, int] = {}
+    if per_profile_cap is not None:
+        per_profile_running = {
+            row["assignee"]: int(row["n"])
+            for row in conn.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL "
+                "GROUP BY assignee"
+            )
+        }
+
+    candidates: list[str] = []
+    rows = conn.execute(
+        "SELECT id, status, assignee FROM tasks "
+        "WHERE status IN ('ready', 'review') AND assignee IS NOT NULL "
+        "AND claim_lock IS NULL ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    for row in rows:
+        assignee = row["assignee"]
+        if profile_exists is not None and not profile_exists(assignee):
+            continue
+        if (
+            per_profile_cap is not None
+            and per_profile_running.get(assignee, 0) >= per_profile_cap
+        ):
+            continue
+        if row["status"] == "ready":
+            if check_respawn_guard(conn, row["id"]) is not None:
+                continue
+        candidates.append(row["id"])
+    if free_global_slots is not None:
+        candidates = candidates[:free_global_slots]
+    snapshot["dispatchable_count"] = len(candidates)
+    snapshot["dispatchable_task_ids"] = candidates
+    return snapshot
 
 
 def dispatch_once(

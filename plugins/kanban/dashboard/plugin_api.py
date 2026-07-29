@@ -55,6 +55,8 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_DISPATCHER_HEALTH_STALE_AFTER_SECONDS = 600
+
 
 # ---------------------------------------------------------------------------
 # Auth helper — WebSocket only (HTTP routes live behind the dashboard's
@@ -1312,6 +1314,33 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
 # spawn failures, stuck-blocked). See hermes_cli.kanban_diagnostics for
 # the rule engine.
 # ---------------------------------------------------------------------------
+
+@router.get("/dispatcher/health")
+def get_dispatcher_health():
+    """Return the latest machine-readable embedded-dispatcher health signal."""
+    checked_at = int(time.time())
+    signal = kanban_db.read_dispatcher_health()
+    if signal is None:
+        return {
+            "available": False,
+            "stale": True,
+            "checked_at": checked_at,
+            "signal": None,
+        }
+    updated_at = signal.get("updated_at")
+    try:
+        age_seconds = max(0, checked_at - int(str(updated_at)))
+    except (TypeError, ValueError):
+        age_seconds = None
+    stale = age_seconds is None or age_seconds > _DISPATCHER_HEALTH_STALE_AFTER_SECONDS
+    return {
+        "available": True,
+        "stale": stale,
+        "age_seconds": age_seconds,
+        "checked_at": checked_at,
+        "signal": signal,
+    }
+
 
 @router.get("/diagnostics")
 def list_diagnostics(
