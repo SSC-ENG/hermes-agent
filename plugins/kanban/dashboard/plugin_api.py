@@ -1333,8 +1333,9 @@ def get_dispatcher_health():
     except (TypeError, ValueError):
         age_seconds = None
     stale = age_seconds is None or age_seconds > _DISPATCHER_HEALTH_STALE_AFTER_SECONDS
+    degraded = bool(signal.get("degraded") or signal.get("status") == "unavailable")
     return {
-        "available": True,
+        "available": not degraded,
         "stale": stale,
         "age_seconds": age_seconds,
         "checked_at": checked_at,

@@ -8019,6 +8019,22 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # Restrict this to code/PR-producing tasks. Evidence-reconciliation and
+    # research tasks commonly cite PR URLs but use a dir workspace with no
+    # branch; suppressing those tasks creates a false duplicate-PR signal.
+    task_shape = conn.execute(
+        "SELECT workspace_kind, branch_name FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    code_task = bool(
+        task_shape
+        and (
+            task_shape["workspace_kind"] == "worktree"
+            or (task_shape["branch_name"] or "").strip()
+        )
+    )
+    if not code_task:
+        return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
@@ -8141,7 +8157,9 @@ def dispatcher_capacity_snapshot(
     rows = conn.execute(
         "SELECT id, status, assignee FROM tasks "
         "WHERE status IN ('ready', 'review') AND assignee IS NOT NULL "
-        "AND claim_lock IS NULL ORDER BY priority DESC, created_at ASC"
+        "AND claim_lock IS NULL "
+        "ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, "
+        "priority DESC, created_at ASC"
     ).fetchall()
     for row in rows:
         assignee = row["assignee"]
@@ -8156,6 +8174,8 @@ def dispatcher_capacity_snapshot(
             if check_respawn_guard(conn, row["id"]) is not None:
                 continue
         candidates.append(row["id"])
+        if per_profile_cap is not None:
+            per_profile_running[assignee] = per_profile_running.get(assignee, 0) + 1
     if free_global_slots is not None:
         candidates = candidates[:free_global_slots]
     snapshot["dispatchable_count"] = len(candidates)
@@ -8569,6 +8589,8 @@ def _dispatch_once_locked(
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if max_in_progress is not None and running_count + spawned >= max_in_progress:
+            break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -8579,8 +8601,19 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        if _per_profile_cap is not None:
+            current = _per_profile_running.get(row["assignee"], 0)
+            if current >= _per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], row["assignee"], current)
+                )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            if _per_profile_cap is not None:
+                _per_profile_running[row["assignee"]] = (
+                    _per_profile_running.get(row["assignee"], 0) + 1
+                )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -8625,6 +8658,10 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if _per_profile_cap is not None and claimed.assignee:
+                _per_profile_running[claimed.assignee] = (
+                    _per_profile_running.get(claimed.assignee, 0) + 1
+                )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
