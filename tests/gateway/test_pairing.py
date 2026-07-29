@@ -123,14 +123,12 @@ class TestCodeGeneration:
             code = store.generate_code("telegram", "user1", "Alice")
             pending = store.list_pending("telegram")
         assert len(pending) == 1
-        # list_pending no longer returns the original code. It returns a
-        # request id that admins can approve, plus diagnostic hash metadata.
+        # list_pending never returns the original code — it returns a
+        # server-side request id an authenticated admin can approve.
         assert pending[0]["user_id"] == "user1"
         assert pending[0]["user_name"] == "Alice"
         assert pending[0]["request_id"]
-        assert pending[0]["code"] == pending[0]["request_id"]
-        assert pending[0]["code_hash_prefix"]
-        assert pending[0]["code"] != code
+        assert pending[0]["request_id"] != code
 
 
 # ---------------------------------------------------------------------------
@@ -266,9 +264,9 @@ class TestLegacyPendingFileCompat:
             pending = store.list_pending("telegram")
         assert len(pending) == 1
         assert pending[0]["user_id"] == "legacy-user"
+        # No salt/hash means nothing approvable — the entry is visible only so
+        # the operator can watch it age out at TTL.
         assert pending[0]["request_id"] == ""
-        assert pending[0]["code"] == ""
-        assert pending[0]["code_hash_prefix"] == "legacy"  # placeholder
 
     def test_cleanup_expired_removes_legacy_at_ttl(self, tmp_path):
         """Legacy entries past CODE_TTL must still get pruned."""
@@ -459,6 +457,58 @@ class TestApprovalFlow:
         assert result["user_id"] == "user1"
         assert result["user_name"] == "Alice"
         assert remaining == []
+
+    def test_approve_request_never_reveals_or_accepts_the_code_digest(self, tmp_path):
+        """`list_pending` exposes an approvable id and nothing derived from the code.
+
+        The pre-fix listing returned the code's hash prefix under a ``code``
+        key, which admin GUIs posted straight back to approve — it could never
+        match, because approval hashes its input and compares to that digest.
+        """
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            bot_code = store.generate_code("telegram", "user1", "Alice")
+            entry = store.list_pending("telegram")[0]
+
+            digest = json.loads(
+                (tmp_path / "telegram-pending.json").read_text()
+            )[entry["request_id"]]["hash"]
+
+            assert set(entry) == {
+                "platform",
+                "request_id",
+                "user_id",
+                "user_name",
+                "age_minutes",
+            }
+            assert bot_code not in entry.values()
+            assert entry["request_id"] not in (digest, digest[:8])
+            # The digest prefix is not a credential on either grant path.
+            assert store.approve_code("telegram", digest[:8]) is None
+            assert store.approve_request("telegram", digest[:8]) is None
+
+    def test_stale_request_id_never_locks_out_the_code_path(self, tmp_path):
+        """Clicking Approve on an expired row is not a brute-force attempt.
+
+        Request ids only reach an admin already authenticated to this store, so
+        a miss means the row went stale — counting it toward the code lockout
+        let a handful of GUI clicks lock the operator out of `pairing approve`.
+        """
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            code = store.generate_code("telegram", "user1", "Alice")
+            stale_id = store.list_pending("telegram")[0]["request_id"]
+            assert store.approve_request("telegram", stale_id) is not None
+
+            # Re-click the now-approved row well past the lockout threshold.
+            for _ in range(MAX_FAILED_ATTEMPTS + 3):
+                assert store.approve_request("telegram", stale_id) is None
+
+            assert store._is_locked_out("telegram") is False
+            # And the code path is still usable for the next real request.
+            next_code = store.generate_code("telegram", "user2", "Bee")
+            assert store.approve_code("telegram", next_code) is not None
+            assert code != next_code
 
     def test_approve_case_insensitive(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
