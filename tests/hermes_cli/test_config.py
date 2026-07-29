@@ -1245,39 +1245,190 @@ class TestConfigVersionDetection:
             assert check_config_version() == (latest, latest)
 
 
-class TestAnthropicTokenMigration:
-    """Test that config version 8→9 clears ANTHROPIC_TOKEN."""
+class TestConfigSupportFloor:
+    """Auto-migration support floor (v12).
 
-    def _write_config_version(self, tmp_path, version):
+    Configs below ``SUPPORT_FLOOR_VERSION`` are refused: the file stays
+    byte-for-byte untouched, a clear actionable message is surfaced (stdout
+    when not quiet + stderr always + results['warnings']), and the process
+    continues without crashing — matching the fail-safe posture for
+    unparseable configs. Configs at or above the floor migrate exactly as
+    before the floor was introduced (parity fixtures below).
+    """
+
+    def _write_config(self, tmp_path, data):
         config_path = tmp_path / "config.yaml"
-        import yaml
-        config_path.write_text(yaml.safe_dump({"_config_version": version}))
+        text = yaml.safe_dump(data)
+        config_path.write_text(text, encoding="utf-8")
+        return config_path, text
 
-    def test_clears_token_on_upgrade_to_v9(self, tmp_path):
-        """ANTHROPIC_TOKEN is cleared unconditionally when upgrading to v9."""
-        self._write_config_version(tmp_path, 8)
+    def test_v11_config_is_refused_and_untouched(self, tmp_path, capsys):
+        config_path, original = self._write_config(
+            tmp_path,
+            {
+                "_config_version": 11,
+                "custom_providers": [
+                    {"name": "Old", "base_url": "http://localhost:1234/v1"}
+                ],
+            },
+        )
         (tmp_path / ".env").write_text("ANTHROPIC_TOKEN=old-token\n")
-        with patch.dict(os.environ, {
-            "HERMES_HOME": str(tmp_path),
-            "ANTHROPIC_TOKEN": "old-token",
-        }):
-            migrate_config(interactive=False, quiet=True)
-            assert load_env().get("ANTHROPIC_TOKEN") == ""
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=False)
 
-    def test_skips_on_version_9_or_later(self, tmp_path):
-        """Already at v9 — ANTHROPIC_TOKEN is not touched."""
-        self._write_config_version(tmp_path, 9)
-        (tmp_path / ".env").write_text("ANTHROPIC_TOKEN=current-token\n")
-        with patch.dict(os.environ, {
-            "HERMES_HOME": str(tmp_path),
-            "ANTHROPIC_TOKEN": "current-token",
-        }):
+            # File untouched — no migration, no version bump, no rewrite.
+            assert config_path.read_text(encoding="utf-8") == original
+            # .env untouched too (the retired <12 steps used to clear tokens).
+            assert load_env().get("ANTHROPIC_TOKEN") == "old-token"
+
+        captured = capsys.readouterr()
+        expected_fragment = (
+            "This config predates version 12 (~2 years old) and can no "
+            "longer be auto-migrated."
+        )
+        assert expected_fragment in captured.out
+        assert expected_fragment in captured.err
+        assert "run `hermes setup` to regenerate" in captured.out
+        assert "_config_version: 12" in captured.out
+        assert any(expected_fragment in w for w in results["warnings"])
+        # No 'Config version: X → Y' line — nothing was migrated.
+        assert "Config version:" not in captured.out
+
+    def test_v11_quiet_still_warns_on_stderr_only(self, tmp_path, capsys):
+        config_path, original = self._write_config(
+            tmp_path, {"_config_version": 11}
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+        assert config_path.read_text(encoding="utf-8") == original
+        captured = capsys.readouterr()
+        assert "can no longer be auto-migrated" in captured.err
+        assert captured.out == ""
+        assert results["warnings"]
+
+    def test_floor_message_uses_display_hermes_home(self):
+        from hermes_cli.config_migrations import support_floor_message
+        from hermes_constants import display_hermes_home
+
+        msg = support_floor_message()
+        assert f"{display_hermes_home()}/config.yaml" in msg
+
+    def test_registry_has_no_targets_below_floor(self):
+        from hermes_cli.config_migrations import (
+            MIGRATIONS,
+            SUPPORT_FLOOR_VERSION,
+        )
+
+        assert SUPPORT_FLOOR_VERSION == 12
+        assert all(target >= SUPPORT_FLOOR_VERSION for target, _ in MIGRATIONS)
+        # v12's own step is retained: a config AT v11 is refused, but a
+        # config AT v12 must still receive every remaining migration.
+        assert MIGRATIONS[0][0] == 12
+
+    # ── Parity fixtures ──────────────────────────────────────────────
+    # Expected outputs captured by running migrate_config from origin/main
+    # (commit 28524adb0e, pre-floor) in a subprocess against these exact
+    # fixtures. The floor must not change behavior for v12+ configs.
+
+    _V12_FIXTURE = {
+        "_config_version": 12,
+        "model": {"default": "openai/gpt-5.4", "provider": "openrouter"},
+        "display": {"tool_progress_overrides": {"telegram": "verbose"}},
+        "stt": {"model": "base", "provider": "local"},
+        "compression": {"summary_model": "gpt-x", "summary_provider": "auto"},
+        "model_catalog": {"ttl_hours": 24},
+        "memory": {"write_mode": "approve"},
+        "delegation": {"max_async_children": 8},
+        "agent": {"verify_on_stop": True},
+    }
+    _V12_EXPECTED = {
+        "_config_version": 33,
+        "agent": {"verify_on_stop": False},
+        "auxiliary": {"compression": {"model": "gpt-x"}},
+        "compression": {},
+        "delegation": {"max_concurrent_children": 8},
+        "display": {
+            "platforms": {"telegram": {"tool_progress": "verbose"}},
+            "tool_progress_overrides": {"telegram": "verbose"},
+        },
+        "memory": {"write_approval": True},
+        "model": {"default": "openai/gpt-5.4", "provider": "openrouter"},
+        "model_catalog": {"ttl_hours": 1},
+        "plugins": {"enabled": []},
+        "stt": {"provider": "local"},
+    }
+
+    _V20_FIXTURE = {
+        "_config_version": 20,
+        "model": {"default": "anthropic/claude-fable-5", "provider": "nous"},
+        "plugins": {"disabled": ["foo"]},
+        "skills": {"write_mode": "on"},
+        "model_catalog": {"ttl_hours": 24},
+        "agent": {},
+    }
+    _V20_EXPECTED = {
+        "_config_version": 33,
+        "agent": {"verify_on_stop": False},
+        "model": {"default": "anthropic/claude-fable-5", "provider": "nous"},
+        "model_catalog": {"ttl_hours": 1},
+        "plugins": {"disabled": ["foo"], "enabled": []},
+    }
+
+    _ENV_FIXTURE = (
+        "LLM_MODEL=old-model\nOPENAI_MODEL=old-openai\nOPENROUTER_API_KEY=test\n"
+    )
+
+    @pytest.mark.parametrize(
+        "fixture,expected,expected_env",
+        [
+            (
+                _V12_FIXTURE,
+                _V12_EXPECTED,
+                # v12→13 clears LLM_MODEL/OPENAI_MODEL for configs below 13.
+                "LLM_MODEL=\nOPENAI_MODEL=\nOPENROUTER_API_KEY=test\n",
+            ),
+            (_V20_FIXTURE, _V20_EXPECTED, _ENV_FIXTURE),
+        ],
+        ids=["v12", "v20"],
+    )
+    def test_at_or_above_floor_migrates_identically_to_pre_floor(
+        self, tmp_path, fixture, expected, expected_env
+    ):
+        config_path, _ = self._write_config(tmp_path, fixture)
+        (tmp_path / ".env").write_text(self._ENV_FIXTURE, encoding="utf-8")
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             migrate_config(interactive=False, quiet=True)
-            assert load_env().get("ANTHROPIC_TOKEN") == "current-token"
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        # Pin the golden version the fixtures were captured at, then compare
+        # the rest against the same-latest expectation. If _config_version has
+        # advanced past 33, only the version key may differ.
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        raw.pop("_config_version")
+        exp = dict(expected)
+        exp.pop("_config_version")
+        if DEFAULT_CONFIG["_config_version"] == 33:
+            assert raw == exp
+        else:  # future migrations appended — golden subset must still hold
+            for key, val in exp.items():
+                assert raw.get(key) == val, f"parity drift on {key!r}"
+        assert (tmp_path / ".env").read_text(encoding="utf-8") == expected_env
 
 
 class TestCustomProviderCompatibility:
-    """Custom provider compatibility across legacy and v12+ config schemas."""
+    """Custom provider compatibility across legacy and v12+ config schemas.
+
+    The v11→12 step (_migrate_to_12) is retained in the registry per the
+    support-floor policy, but migrate_config() refuses sub-v12 configs, so
+    these tests drive run_migrations() directly to keep the step covered.
+    """
+
+    @staticmethod
+    def _run_ladder(current_ver: int):
+        from hermes_cli.config_migrations import run_migrations
+
+        results = {"env_added": [], "config_added": [], "warnings": []}
+        run_migrations(current_ver, results, quiet=True)
+        return results
 
     def test_v11_upgrade_moves_custom_providers_into_providers(self, tmp_path):
         config_path = tmp_path / "config.yaml"
@@ -1307,11 +1458,9 @@ class TestCustomProviderCompatibility:
         )
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            migrate_config(interactive=False, quiet=True)
+            self._run_ladder(11)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        from hermes_cli.config import DEFAULT_CONFIG
-        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert raw["providers"]["openai-direct"] == {
             "api": "https://api.openai.com/v1",
             "api_key": "test-key",
@@ -1359,7 +1508,7 @@ class TestCustomProviderCompatibility:
         )
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            migrate_config(interactive=False, quiet=True)
+            self._run_ladder(11)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
             compatible = get_compatible_custom_providers(raw)
 
@@ -1597,7 +1746,7 @@ class TestDiscordChannelPromptsConfig:
         config_path = tmp_path / "config.yaml"
         config_path.write_text(
             yaml.safe_dump({
-                "_config_version": 3,
+                "_config_version": 11,
                 "model": {"default": "test-model", "provider": "openrouter"},
                 "custom_providers": [
                     {"name": "local-llm", "base_url": "http://localhost:8080/v1",
@@ -1607,8 +1756,13 @@ class TestDiscordChannelPromptsConfig:
             encoding="utf-8",
         )
 
+        results = {"env_added": [], "config_added": [], "warnings": []}
+        from hermes_cli.config_migrations import run_migrations
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            migrate_config(interactive=False, quiet=True)
+            # Drive the ladder directly: migrate_config() refuses sub-v12
+            # configs since the support floor, but the write-invariant this
+            # test guards (#40821) lives in the steps themselves.
+            run_migrations(11, results, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
         # custom_providers migrated to providers dict (by design, v11->v12)
@@ -1835,11 +1989,12 @@ class TestMigrationWriteInvariant:
             "the config-bloat regression (lean config → DEFAULT_CONFIG dump)."
         )
 
-    @pytest.mark.parametrize("start_version", [1, "latest_minus_one"])
+    @pytest.mark.parametrize("start_version", [12, "latest_minus_one"])
     def test_version_bump_keeps_config_lean(self, tmp_path, start_version):
         """A lean config migrated to the latest version must never be rewritten
-        into a defaults dump — neither across the whole range (start=1, where
-        per-version seeds also fire) nor on a bare one-version bump (where only
+        into a defaults dump — neither across the whole supported range
+        (start=12, the auto-migration floor, where per-version seeds also
+        fire) nor on a bare one-version bump (where only
         the catch-all finalizer runs). In both cases no default-only top-level
         section the user never wrote may land on disk, the merged view still
         exposes every default, and the user's explicit non-default value
