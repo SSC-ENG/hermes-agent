@@ -21,6 +21,20 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def _make_code_task(conn, task_id: str) -> None:
+    """Mark the task as a code/PR-producing task (branch_name set).
+
+    ``check_respawn_guard`` deliberately scopes the ``active_pr`` guard to
+    code tasks (worktree workspace or a branch name) so evidence/research
+    tasks that merely cite PR URLs are not suppressed. These tests exercise
+    the guard itself, so the fixture task must look like a code task.
+    """
+    conn.execute(
+        "UPDATE tasks SET branch_name = 'fix/test-branch' WHERE id = ?",
+        (task_id,),
+    )
+
+
 def _add_pr_comment(conn, task_id: str, created_at: int) -> None:
     conn.execute(
         "INSERT INTO task_comments (task_id, author, body, created_at) "
@@ -37,6 +51,7 @@ def test_respawn_guard_recent_pr_without_requeue_is_active(kanban_home):
     """Recent PR evidence with no later requeue keeps the active_pr guard."""
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="has-pr", assignee="alice")
+        _make_code_task(conn, task_id)
         _add_pr_comment(conn, task_id, int(time.time()) - 10)
 
         reason = kb.check_respawn_guard(conn, task_id)
@@ -55,6 +70,7 @@ def test_respawn_guard_active_pr_bypassed_by_later_requeue(
             title=f"requeued-after-pr-{event_kind}",
             assignee="alice",
         )
+        _make_code_task(conn, task_id)
         now = int(time.time())
         _add_pr_comment(conn, task_id, now - 20)
         conn.execute(
@@ -75,6 +91,7 @@ def test_respawn_guard_active_pr_not_bypassed_by_earlier_requeue(kanban_home):
             title="requeued-before-pr",
             assignee="alice",
         )
+        _make_code_task(conn, task_id)
         now = int(time.time())
         conn.execute(
             "INSERT INTO task_events (task_id, kind, created_at) "
@@ -98,6 +115,7 @@ def test_respawn_guard_active_pr_not_bypassed_by_same_timestamp_requeue(
             title="requeued-at-pr-timestamp",
             assignee="alice",
         )
+        _make_code_task(conn, task_id)
         created_at = int(time.time()) - 10
         _add_pr_comment(conn, task_id, created_at)
         conn.execute(
