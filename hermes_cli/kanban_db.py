@@ -288,6 +288,192 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Exit code a kanban worker uses when the conversation loop ends in a terminal
+# (non-success) state — truncation give-up, partial stream exhaustion, or an
+# unrecoverable loop error — and the worker either:
+#   * auto-blocked the card (kind=transient) with the loop error as reason, or
+#   * failed to write a board transition and is signalling that to the
+#     dispatcher via a non-zero exit so reap never records a bare
+#     protocol_violation (clean rc=0 with no lifecycle tool).
+# 76 is adjacent to EX_TEMPFAIL (75) and unused elsewhere in the worker.
+KANBAN_TERMINAL_LOOP_EXIT_CODE = 76
+
+# Prefix stamped into run.error / task.last_failure_error when the worker
+# (not the dispatcher) reported a terminal conversation-loop error. Lets
+# BEL triage distinguish "model never called lifecycle tools" from
+# "loop gave up mid-stream and the worker wrote the failure" without
+# grepping session logs.
+KANBAN_TERMINAL_LOOP_ERROR_PREFIX = "terminal loop error: "
+
+
+def is_terminal_conversation_loop_result(result: Optional[dict]) -> bool:
+    """True when a run_conversation result is a terminal non-success loop end.
+
+    Covers truncation give-up (``partial=True`` / ``completed=False`` +
+    error), bare ``failed`` results with an error string, and other
+    completed=False/partial endings. Interruptions and rate-limit/billing
+    failures are excluded — those have their own lifecycle contracts.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("interrupted"):
+        return False
+    # Provider throttle / billing are handled via KANBAN_RATE_LIMIT_EXIT_CODE.
+    if result.get("failure_reason") in ("rate_limit", "billing"):
+        return False
+    if result.get("completed") is True:
+        return False
+    if result.get("partial"):
+        return True
+    if result.get("failed") and result.get("error"):
+        return True
+    # completed=False with an explicit error (truncation give-up shape, etc.).
+    if result.get("completed") is False and result.get("error"):
+        return True
+    return False
+
+
+def format_terminal_loop_error(result: Optional[dict]) -> str:
+    """Build the human/operator-facing loop-error reason string."""
+    if not isinstance(result, dict):
+        return f"{KANBAN_TERMINAL_LOOP_ERROR_PREFIX}unknown conversation-loop failure"
+    err = (
+        result.get("error")
+        or result.get("final_response")
+        or result.get("turn_exit_reason")
+        or "conversation loop ended without completion"
+    )
+    err = str(err).strip() or "conversation loop ended without completion"
+    # Avoid double-prefixing if a caller already stamped it.
+    if err.startswith(KANBAN_TERMINAL_LOOP_ERROR_PREFIX):
+        return err
+    return f"{KANBAN_TERMINAL_LOOP_ERROR_PREFIX}{err}"
+
+
+def finalize_kanban_worker_terminal_loop_error(
+    task_id: Optional[str] = None,
+    *,
+    result: Optional[dict] = None,
+    error: Optional[str] = None,
+    kind: str = "transient",
+    expected_run_id: Optional[int] = None,
+) -> dict:
+    """Auto-block a kanban worker task after a terminal conversation-loop error.
+
+    Returns a status dict::
+
+        {
+          "acted": bool,          # True when this call transitioned the task
+          "status": str | None,   # post-call task status when known
+          "reason": str,          # reason written / that would be written
+          "error": str | None,    # helper failure detail, else None
+        }
+
+    Safe to call when *task_id* is missing or the task is already terminal —
+    those are no-ops with ``acted=False``. Never raises.
+    """
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    reason = (error or "").strip() or format_terminal_loop_error(result)
+    out: dict = {
+        "acted": False,
+        "status": None,
+        "reason": reason,
+        "error": None,
+    }
+    if not tid:
+        out["error"] = "no HERMES_KANBAN_TASK"
+        return out
+    if kind is not None and kind not in VALID_BLOCK_KINDS:
+        out["error"] = f"invalid block kind {kind!r}"
+        return out
+    if expected_run_id is None:
+        raw_run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        if raw_run:
+            try:
+                expected_run_id = int(raw_run)
+            except ValueError:
+                expected_run_id = None
+    try:
+        conn = connect()
+    except Exception as exc:  # pragma: no cover - env isolation
+        out["error"] = f"connect failed: {exc}"
+        return out
+    try:
+        task = get_task(conn, tid)
+        if task is None:
+            out["error"] = f"unknown task {tid}"
+            return out
+        out["status"] = task.status
+        if task.status not in ("running", "ready"):
+            # Already terminal (blocked/done/etc). Treat as success so the
+            # worker can exit without a bare protocol_violation ghost.
+            return out
+        meta = {
+            "source": "worker_terminal_loop_error",
+            "loop_error": reason,
+            "partial": bool(result.get("partial")) if isinstance(result, dict) else None,
+            "failed": bool(result.get("failed")) if isinstance(result, dict) else None,
+            "turn_exit_reason": (
+                result.get("turn_exit_reason") if isinstance(result, dict) else None
+            ),
+        }
+        ok = block_task(
+            conn,
+            tid,
+            reason=reason,
+            kind=kind,
+            expected_run_id=expected_run_id,
+        )
+        if not ok:
+            out["error"] = (
+                f"block_task refused for {tid} "
+                f"(status={task.status!r}, expected_run_id={expected_run_id!r})"
+            )
+            return out
+        # Annotate the just-ended run so BEL triage sees a loop error, not a
+        # bare protocol_violation. block_task ends the run without metadata.
+        try:
+            run = latest_run(conn, tid)
+            if run is not None:
+                with write_txn(conn):
+                    conn.execute(
+                        """
+                        UPDATE task_runs
+                           SET error    = COALESCE(error, ?),
+                               metadata = ?
+                         WHERE id = ?
+                        """,
+                        (
+                            reason[:1000],
+                            json.dumps(meta, ensure_ascii=False),
+                            int(run.id),
+                        ),
+                    )
+        except Exception as exc:
+            # Transition already landed; metadata is best-effort.
+            _log.debug(
+                "finalize_kanban_worker_terminal_loop_error: metadata update failed: %s",
+                exc,
+            )
+        landed = get_task(conn, tid)
+        out["acted"] = True
+        out["status"] = landed.status if landed else "blocked"
+        return out
+    except Exception as exc:
+        _log.warning(
+            "finalize_kanban_worker_terminal_loop_error failed for %s: %s",
+            tid,
+            exc,
+            exc_info=True,
+        )
+        out["error"] = str(exc)
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -8260,6 +8446,12 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"terminal_loop_error"`` — ``WIFEXITED`` with status
+      ``KANBAN_TERMINAL_LOOP_EXIT_CODE``. The worker's conversation loop
+      ended without completion (truncation give-up, etc.). Prefer that the
+      worker already wrote a ``kanban_block`` before exiting; if the task
+      is still ``running`` this is still a hard failure (auto-block) but the
+      error text names the *loop error*, not a bare protocol violation.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -8267,8 +8459,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``terminal_loop_error`` / ``nonzero_exit``) or the signal number (for
+    ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -8281,6 +8473,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_TERMINAL_LOOP_EXIT_CODE:
+                return ("terminal_loop_error", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -8926,9 +9120,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
-    # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    # counter (see the post-txn loop below). ``force_block`` trips the
+    # breaker on first occurrence (terminal loop / non-recoverable
+    # worker-reported failures) without waiting on either budget.
+    crash_details: list[tuple[str, int, str, bool, str, bool]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, force_block)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -8954,6 +9150,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            force_block = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -9000,6 +9197,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
+                }
+            elif kind == "terminal_loop_error":
+                # Worker reported a conversation-loop failure (truncation
+                # give-up / partial stream) via KANBAN_TERMINAL_LOOP_EXIT_CODE
+                # but left the task ``running`` — the auto-block write failed
+                # (or an older worker only set the exit code). Distinguish
+                # this from a bare protocol_violation so BEL triage does not
+                # have to grep session logs (t_8165e956 acceptance #2).
+                # Force auto-block on first occurrence — retrying a terminal
+                # loop error is deterministic waste (not a paperwork miss).
+                protocol_violation = False
+                force_block = True
+                error_text = (
+                    f"{KANBAN_TERMINAL_LOOP_ERROR_PREFIX}"
+                    f"worker exited rc={code} without completing the task "
+                    f"(conversation loop ended; lifecycle write missing)"
+                )
+                event_kind = "terminal_loop_error"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "exit_kind": kind,
+                    "source": "worker_terminal_loop_error",
                 }
             else:
                 protocol_violation = False
@@ -9050,13 +9271,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     )
                     rate_limited.append(row["id"])
                 else:
-                    if protocol_violation:
+                    if protocol_violation or force_block:
                         # Stamp the failure error now: a below-budget
                         # violation never reaches ``_record_task_failure``
                         # (which stamps this column for every other failure
                         # kind), yet the board UI and the retry worker's
                         # context still need the violation message + the
-                        # corrective guidance it carries.
+                        # corrective guidance it carries. force_block paths
+                        # also stamp early so triage sees the loop error
+                        # even if the force-trip call is racing.
                         conn.execute(
                             "UPDATE tasks SET last_failure_error = ? "
                             "WHERE id = ?",
@@ -9065,7 +9288,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, force_block)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -9087,10 +9310,31 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, claimer, protocol_violation, error_text, force_block in crash_details:
+            if force_block:
+                # Terminal loop / non-recoverable worker-reported failure:
+                # trip immediately. Do not route through the protocol-
+                # violation retry budget — truncating again won't help.
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="crashed",
+                    failure_limit=1,
+                    force_trip=True,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid,
+                        "claimer": claimer,
+                        "source": "worker_terminal_loop_error",
+                    },
+                )
+                if tripped:
+                    auto_blocked.append(tid)
+                continue
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
