@@ -1595,21 +1595,16 @@ def _cmd_intake(args: argparse.Namespace) -> int:
 def _cmd_telemetry_review(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_telemetry
 
-    with kb.connect_closing() as conn:
-        report = kanban_telemetry.run_review(
-            conn,
-            board_slug=kb.get_current_board(),
-            db_path=kb.kanban_db_path(),
-            window_end=args.window_end,
-        )
     output_dir = (
         Path(args.output_dir).expanduser()
         if args.output_dir
-        else Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "kanban" / "reviews"
+        else None
     )
-    json_path, md_path = kanban_telemetry.write_artifacts(report, output_dir)
-    with kb.connect_closing() as conn:
-        kanban_telemetry.persist_review(conn, report, json_path, md_path)
+    report, json_path, md_path = kanban_telemetry.run_scheduled_review(
+        board_slug=kb.get_current_board(),
+        window_end=args.window_end,
+        output_dir=output_dir,
+    )
     payload = {
         "status": report["review"]["status"],
         "json": str(json_path),

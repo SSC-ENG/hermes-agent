@@ -7,7 +7,7 @@ import os
 import sqlite3
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,6 +18,7 @@ INTAKE_DECISION_SECONDS = 30 * 60
 RUNNING_INACTIVITY_SECONDS = 60 * 60
 BLOCKED_AGING_SECONDS = 12 * 60 * 60
 FINDING_RETENTION_SECONDS = 7 * 24 * 60 * 60
+NOMINAL_BOUNDARY_MINUTE = 15
 
 _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "linear_scoped": ("linear_issue_key", "sub_issue_keys", "cptc_estimates"),
@@ -74,6 +75,26 @@ def record_event(
 
 def _utc(epoch: int) -> str:
     return datetime.fromtimestamp(int(epoch), timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def nominal_window_end(now: Optional[int] = None) -> int:
+    """Return the latest 00:15/12:15 America/Phoenix cadence boundary."""
+    from zoneinfo import ZoneInfo
+
+    current = datetime.fromtimestamp(
+        int(now if now is not None else time.time()),
+        ZoneInfo("America/Phoenix"),
+    )
+    boundary_hour = 12 if (current.hour, current.minute) >= (12, NOMINAL_BOUNDARY_MINUTE) else 0
+    candidate = current.replace(
+        hour=boundary_hour,
+        minute=NOMINAL_BOUNDARY_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if current < candidate:
+        candidate -= timedelta(hours=12)
+    return int(candidate.timestamp())
 
 
 def _implementation_sha() -> str:
@@ -231,8 +252,9 @@ def _capture_snapshot(
             placeholders = ",".join("?" for _ in tasks)
             all_rows = conn.execute(
                 f"SELECT id, task_id, kind, payload, created_at, run_id FROM task_events "
-                f"WHERE task_id IN ({placeholders}) AND id <= ? ORDER BY id",
-                (*sorted(tasks), high),
+                f"WHERE task_id IN ({placeholders}) AND id <= ? "
+                f"AND created_at < ? ORDER BY id",
+                (*sorted(tasks), high, end),
             ).fetchall()
             all_events = [
                 {
@@ -323,6 +345,23 @@ def run_review(
         by_kind.setdefault(event["kind"], []).append(event)
 
     holes: list[dict[str, Any]] = []
+    previous_run = conn.execute(
+        "SELECT window_end FROM telemetry_review_runs "
+        "WHERE board_slug = ? AND status = 'COMPLETE' AND window_end < ? "
+        "ORDER BY window_end DESC LIMIT 1",
+        (board_slug, end),
+    ).fetchone()
+    if previous_run is not None:
+        expected_previous = end - CADENCE_SECONDS
+        previous_end = int(previous_run["window_end"])
+        if previous_end < expected_previous:
+            holes.append(_finding(
+                "REVIEW.MISSED_RUN", board_slug, _subject(), severity="CRITICAL",
+                evidence_state="MEASURED", title="Scheduled telemetry review boundary was missed",
+                owner="rhea-ramos", recommendation="Repair supervision so every nominal 12-hour boundary persists a complete artifact.",
+                evidence=[{"event_ids": [], "query_id": "Q-REVIEW-01", "fact": f"Latest prior complete boundary was {_utc(previous_end)}; expected {_utc(expected_previous)}."}],
+                observed_at=expected_previous, next_expected_event="telemetry_review_completed", due_by=end,
+            ))
     included_ids = sorted(tasks)
     if included_ids:
         holes.append(_finding(
@@ -451,6 +490,57 @@ def run_review(
         "holes": holes,
         "council": {"trc_convener": "tessa-cole", "guardian_attendees": [], "waivers": [], "conflicts_resolved": [], "verdict": "GO-WITH-CHANGES" if any(h["state"] != "RESOLVED" for h in holes) else "GO"},
     }
+
+
+def run_scheduled_review(
+    *,
+    board_slug: str,
+    window_end: Optional[int] = None,
+    generated_at: Optional[int] = None,
+    output_dir: Optional[Path] = None,
+) -> tuple[dict[str, Any], Path, Path]:
+    """Run and persist one nominal review cycle for a board."""
+    from hermes_cli import kanban_db as kb
+
+    end = int(window_end if window_end is not None else nominal_window_end(generated_at))
+    db_path = kb.kanban_db_path(board_slug)
+    with kb.connect_closing(board=board_slug) as conn:
+        report = run_review(
+            conn,
+            board_slug=board_slug,
+            db_path=db_path,
+            window_end=end,
+            generated_at=generated_at,
+        )
+    destination = output_dir or kb.board_dir(board_slug) / "reviews"
+    json_path, markdown_path = write_artifacts(report, destination)
+    with kb.connect_closing(board=board_slug) as conn:
+        persist_review(conn, report, json_path, markdown_path)
+    return report, json_path, markdown_path
+
+
+def run_scheduled_reviews(
+    *,
+    now: Optional[int] = None,
+) -> list[tuple[str, dict[str, Any], Path, Path]]:
+    """Run one deterministic cycle for every active board."""
+    from hermes_cli import kanban_db as kb
+
+    end = nominal_window_end(now)
+    results: list[tuple[str, dict[str, Any], Path, Path]] = []
+    try:
+        boards = kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [kb.read_board_metadata(kb.DEFAULT_BOARD)]
+    for board in boards:
+        slug = board.get("slug") or kb.DEFAULT_BOARD
+        report, json_path, markdown_path = run_scheduled_review(
+            board_slug=slug,
+            window_end=end,
+            generated_at=now,
+        )
+        results.append((slug, report, json_path, markdown_path))
+    return results
 
 
 def render_markdown(report: dict[str, Any]) -> str:

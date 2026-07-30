@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -120,3 +122,69 @@ def test_governed_event_validation_fails_closed(board):
     scoped = [event for event in events if event.kind == "linear_scoped"]
     assert len(scoped) == 1
     assert scoped[0].payload["schema_version"] == 1
+
+
+@pytest.mark.parametrize(
+    ("local_now", "expected_local"),
+    [
+        ("2026-07-30T00:14:59", "2026-07-29T12:15:00"),
+        ("2026-07-30T00:15:00", "2026-07-30T00:15:00"),
+        ("2026-07-30T12:14:59", "2026-07-30T00:15:00"),
+        ("2026-07-30T12:15:00", "2026-07-30T12:15:00"),
+    ],
+)
+def test_nominal_window_end_follows_phoenix_boundaries(local_now, expected_local):
+    phoenix = ZoneInfo("America/Phoenix")
+    now = int(datetime.fromisoformat(local_now).replace(tzinfo=phoenix).timestamp())
+    expected = int(datetime.fromisoformat(expected_local).replace(tzinfo=phoenix).timestamp())
+
+    assert telemetry.nominal_window_end(now) == expected
+
+
+def test_scheduled_review_writes_and_persists_both_artifacts(board, tmp_path):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="scheduled", triage=True)
+
+    report, json_path, markdown_path = telemetry.run_scheduled_review(
+        board_slug="default",
+        window_end=end,
+        generated_at=end,
+        output_dir=tmp_path / "reviews",
+    )
+
+    assert json_path.is_file()
+    assert markdown_path.is_file()
+    with kb.connect_closing() as conn:
+        stored = conn.execute(
+            "SELECT json_path, markdown_path, status FROM telemetry_review_runs "
+            "WHERE review_id = ?",
+            (report["review"]["review_id"],),
+        ).fetchone()
+    assert stored["json_path"] == str(json_path)
+    assert stored["markdown_path"] == str(markdown_path)
+    assert stored["status"] == "COMPLETE"
+
+
+def test_missing_nominal_boundary_emits_critical_review_health_hole(board):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "INSERT INTO telemetry_review_runs "
+            "(review_id, board_slug, window_end, event_id_low_exclusive, "
+            "event_id_high_inclusive, generated_at, status) "
+            "VALUES (?, ?, ?, 0, 0, ?, 'COMPLETE')",
+            ("old", "default", end - (2 * telemetry.CADENCE_SECONDS), end),
+        )
+        report = telemetry.run_review(
+            conn,
+            board_slug="default",
+            db_path=kb.kanban_db_path(),
+            window_end=end,
+            generated_at=end,
+        )
+
+    missed = [hole for hole in report["holes"] if hole["rule_id"] == "REVIEW.MISSED_RUN"]
+    assert len(missed) == 1
+    assert missed[0]["severity"] == "CRITICAL"
+    assert missed[0]["owner"] == "rhea-ramos"
