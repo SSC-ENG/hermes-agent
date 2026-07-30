@@ -5241,3 +5241,186 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Worker-log failure classification (truthful spawn telemetry, t_543dce5d)
+# ---------------------------------------------------------------------------
+
+def _setup_dead_worker(conn, monkeypatch, *, pid, log_text=None, title="t"):
+    """Create a running task with a dead pid and an optional worker log."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    tid = kb.create_task(conn, title=title, assignee="a")
+    host = _kb._claimer_id().split(":", 1)[0]
+    conn.execute(
+        "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
+        "WHERE id=?",
+        (pid, f"{host}:w1", tid),
+    )
+    conn.commit()
+    if log_text is not None:
+        log_dir = kb.worker_logs_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / f"{tid}.log").write_text(log_text, encoding="utf-8")
+    return tid
+
+
+def test_billing_wall_clean_exit_not_scored_as_protocol_violation(
+    kanban_home, monkeypatch,
+):
+    """A worker that dies on HTTP 402 with rc=0 must be requeued as
+    rate_limited — NOT recorded as a protocol violation (incident
+    t_543dce5d: 12 consecutive 402s were mis-scored as violations and
+    burned the near-exhausted grant on immediate respawns)."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _setup_dead_worker(
+            conn, monkeypatch, pid=91001,
+            log_text=(
+                "starting worker...\n"
+                'HTTP 402 "Insufficient available credits for this '
+                'inference request"\n'
+            ),
+        )
+        # Simulate the reap registry seeing a clean rc=0 exit.
+        monkeypatch.setattr(
+            _kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0)
+        )
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == []          # not a crash
+        rate_limited = getattr(
+            kb.detect_crashed_workers, "_last_rate_limited", []
+        )
+        assert tid in rate_limited
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert "billing wall" in (task.last_failure_error or "")
+        # No failure counted — the breaker must not see this.
+        row = conn.execute(
+            "SELECT consecutive_failures FROM tasks WHERE id=?", (tid,)
+        ).fetchone()
+        assert row["consecutive_failures"] == 0
+        # Run recorded as rate_limited, not crashed.
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        if run is not None:
+            assert run["outcome"] in (None, "rate_limited")
+        # Event stream carries the loud error_code.
+        ev = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? "
+            "AND kind='rate_limited' ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert ev is not None
+        import json as _json
+        assert _json.loads(ev["payload"])["error_code"] == "billing_exhausted"
+
+
+def test_unknown_skill_startup_crash_classified_loudly(
+    kanban_home, monkeypatch,
+):
+    """A worker that dies at startup on a bad skill pin must surface the
+    Unknown skill(s) detail instead of an opaque 'pid exited with code 1'."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _setup_dead_worker(
+            conn, monkeypatch, pid=91002,
+            log_text="Error: Unknown skill(s): hermes-multi-profile-orchestration\n",
+        )
+        monkeypatch.setattr(
+            _kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1)
+        )
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        err = task.last_failure_error or ""
+        assert "Unknown skill(s)" in err
+        assert "install the skill" in err
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='crashed' ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        import json as _json
+        payload = _json.loads(ev["payload"])
+        assert payload["error_code"] == "unknown_skill"
+        assert "Unknown skill(s)" in payload["error_detail"]
+
+
+def test_missing_profile_startup_crash_classified_loudly(
+    kanban_home, monkeypatch,
+):
+    """A worker that dies because 'hermes -p X' can't find the profile
+    must surface the actionable detail."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _setup_dead_worker(
+            conn, monkeypatch, pid=91003,
+            log_text="Profile 'ghost-profile' does not exist. Create it with: hermes profile create ghost-profile\n",
+        )
+        monkeypatch.setattr(
+            _kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1)
+        )
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        err = task.last_failure_error or ""
+        assert "does not exist" in err
+        assert "reassign" in err
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='crashed' ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        import json as _json
+        assert _json.loads(ev["payload"])["error_code"] == "missing_profile"
+
+
+def test_no_log_falls_back_to_exit_classification(kanban_home, monkeypatch):
+    """Without a worker log, behavior is unchanged (opaque but honest)."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _setup_dead_worker(conn, monkeypatch, pid=91004, log_text=None)
+        monkeypatch.setattr(
+            _kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1)
+        )
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert (task.last_failure_error or "").startswith("pid 91004 exited")
+
+
+def test_stale_log_mtime_ignored(kanban_home, monkeypatch):
+    """A log older than the current run's started_at must not be used as
+    evidence — append-mode logs can carry a prior run's failure lines."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _setup_dead_worker(
+            conn, monkeypatch, pid=91005,
+            log_text="HTTP 402 Insufficient available credits\n",
+        )
+        # Backdate the log mtime far before started_at.
+        log_path = kb.worker_logs_dir() / f"{tid}.log"
+        old = time.time() - 86400
+        os.utime(log_path, (old, old))
+        # Give the task a started_at newer than the log, older than grace.
+        conn.execute(
+            "UPDATE tasks SET started_at=? WHERE id=?",
+            (int(time.time()) - 3600, tid),
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            _kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0)
+        )
+        crashed = kb.detect_crashed_workers(conn)
+        # Stale log ignored → falls through to protocol-violation path.
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert "protocol violation" in (task.last_failure_error or "")

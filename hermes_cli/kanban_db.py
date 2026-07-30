@@ -6787,6 +6787,94 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+# ---------------------------------------------------------------------------
+# Worker-log startup/billing failure signatures (truthful spawn telemetry)
+# ---------------------------------------------------------------------------
+#
+# When a worker dies at startup (bad skill pin, missing profile) or bails on
+# a provider billing wall, the OS-level exit status alone produces opaque
+# noise ("pid exited with code 1", or worse, a clean rc=0 that gets
+# mis-scored as a protocol violation). These signatures let
+# ``detect_crashed_workers`` read the tail of the per-task worker log and
+# classify the failure loudly + actionably instead.
+#
+# Each entry: (error_code, compiled_pattern, message_template).
+# ``{match}`` in the template is replaced with the first matching log line.
+_WORKER_LOG_FAILURE_SIGNATURES: "list[tuple[str, re.Pattern, str]]" = [
+    (
+        "billing_exhausted",
+        re.compile(
+            r"(?:HTTP[\s_-]*)?\b402\b"
+            r"|insufficient(?:[\s_]available)?[\s_]credits"
+            r"|insufficient_quota"
+            r"|exceeded your current quota"
+            r"|billing hard limit",
+            re.IGNORECASE,
+        ),
+        "provider credits exhausted (billing wall): {match}. "
+        "Requeued without counting a failure — add credits or remap the "
+        "assignee profile to a model with balance; the respawn guard will "
+        "pace retries until then.",
+    ),
+    (
+        "unknown_skill",
+        re.compile(r"Unknown skill\(s\)[^\n]*", re.IGNORECASE),
+        "worker startup failed: {match}. The task pins skill(s) that are not "
+        "installed on the assignee profile — install the skill on that "
+        "profile, or re-create the task without the bad skill pin.",
+    ),
+    (
+        "missing_profile",
+        re.compile(r"Profile '[^']+' does not exist[^\n]*"),
+        "worker startup failed: {match}. Create that Hermes profile or "
+        "reassign the task to an installed profile.",
+    ),
+]
+
+# How much of the worker log tail to scan for failure signatures. Startup
+# failures print within the first/last couple hundred bytes; 8 KiB is a
+# comfortable margin without paging megabytes on every dead-pid check.
+_WORKER_LOG_CLASSIFY_TAIL_BYTES = 8192
+
+
+def _classify_worker_failure_from_log(
+    task_id: str, *, board: Optional[str] = None,
+    min_mtime: Optional[float] = None,
+) -> "Optional[tuple[str, str]]":
+    """Scan the tail of a dead worker's log for a known failure signature.
+
+    Returns ``(error_code, detail_message)`` for the first matching
+    signature, or ``None`` when the log is missing/unreadable or matches
+    nothing. Never raises — this is best-effort enrichment; the caller
+    falls back to the OS-level exit classification.
+
+    ``min_mtime`` guards against stale evidence: worker logs are opened in
+    append mode across runs, so the tail can still contain a PRIOR run's
+    failure lines. When set, a log whose mtime predates ``min_mtime``
+    (typically the current run's ``started_at``) is ignored — nothing was
+    written during this run, so its tail proves nothing about this death.
+    """
+    try:
+        path = worker_log_path(task_id, board=board)
+        if not path.exists():
+            return None
+        if min_mtime is not None and path.stat().st_mtime < float(min_mtime):
+            return None
+        tail = read_worker_log(
+            task_id, tail_bytes=_WORKER_LOG_CLASSIFY_TAIL_BYTES, board=board,
+        )
+    except Exception:
+        return None
+    if not tail:
+        return None
+    for code, pattern, template in _WORKER_LOG_FAILURE_SIGNATURES:
+        m = pattern.search(tail)
+        if m:
+            match_line = m.group(0).strip()[:200]
+            return (code, template.format(match=match_line))
+    return None
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -7418,7 +7506,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -7480,8 +7570,43 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            # Enrich the OS-level exit status with evidence from the worker
+            # log tail: a 402/billing wall, a bad skill pin, or a missing
+            # profile all leave a distinctive line in the log while the exit
+            # status alone is opaque (rc=1, or a clean rc=0 that would be
+            # mis-scored as a protocol violation — incident 2026-07-30
+            # t_543dce5d: 12 consecutive 402s recorded as violations).
+            log_class = _classify_worker_failure_from_log(
+                row["id"], board=board,
+                min_mtime=(
+                    float(started_at) if started_at is not None else None
+                ),
+            )
+            log_error_code = log_class[0] if log_class else None
+            log_error_detail = log_class[1] if log_class else None
             rate_limited_exit = False
-            if kind == "clean_exit":
+            if log_error_code == "billing_exhausted":
+                # Billing/credit exhaustion is a provider wall, not a task
+                # failure — same disposition as the EX_TEMPFAIL sentinel:
+                # requeue WITHOUT counting a failure so the breaker can't
+                # trip, and stamp a quota-flavored error so
+                # ``check_respawn_guard`` paces retries. This applies even
+                # when the worker exited rc=0 (it never got a model
+                # response, so there was nothing to complete or block).
+                protocol_violation = False
+                rate_limited_exit = True
+                error_text = (
+                    f"pid {pid} died on a provider billing wall — "
+                    f"{log_error_detail}"
+                )
+                event_kind = "rate_limited"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "error_code": "billing_exhausted",
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -7541,6 +7666,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+                # Loud classification for startup failures: a bad skill pin
+                # or a missing assignee profile crashes the worker pre-flight
+                # with an otherwise-opaque "pid exited with code 1". Attach
+                # the actionable detail from the worker log so the run row,
+                # events, and retry-worker context all say what actually
+                # broke and what to do about it.
+                if log_error_code in ("unknown_skill", "missing_profile"):
+                    error_text = f"{error_text}: {log_error_detail}"
+                    event_payload["error_code"] = log_error_code
+                    event_payload["error_detail"] = log_error_detail
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -8342,7 +8477,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
