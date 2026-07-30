@@ -235,7 +235,7 @@ def receive(
     tenant: Optional[str] = None,
     board: Optional[str] = None,
 ) -> tuple[str, bool]:
-    """Backward-compatible CLI intake entry point."""
+    """Create a canonical governed intake and preserve any attachments."""
     paths = [Path(path).expanduser() for path in files]
     for path in paths:
         if not path.is_file():
@@ -243,46 +243,54 @@ def receive(
     if not text.strip() and not paths:
         raise ValueError("intake requires --text and/or --file")
     kind = source_type(text, paths)
-    digest = raw_hash(text, paths)
     key = idempotency_key(kind, text, paths)
     title = title or f"Raw intake: {kind}"
-    existing = conn.execute(
-        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1",
-        (key,),
-    ).fetchone()
-    task_id = kb.create_task(
-        conn,
-        title=title,
-        body=_legacy_envelope(kind=kind, raw_ref_sha256=digest, received_by=received_by, text=text, attachment_ids=[]),
-        created_by=received_by,
-        priority=priority,
-        tenant=tenant,
-        triage=True,
+    normalized_text = normalize_raw_ref(text)
+    if kind == "url_pile":
+        source_items = [
+            _normalize_url(line)
+            for line in normalized_text.splitlines()
+            if line
+        ]
+    elif kind == "linear_url":
+        source_items = [_normalize_url(normalized_text)]
+    else:
+        source_items = [normalized_text] if normalized_text else []
+    file_refs = [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
+    source_items.extend(f"attachment-sha256:{digest}" for digest in file_refs)
+    envelope = build_envelope(
+        source=f"cli:{received_by}",
+        items=source_items,
+        attachment_refs=[f"sha256:{digest}" for digest in file_refs],
+        tenant_domain=tenant or "unassigned",
+        sensitivity="internal",
         idempotency_key=key,
     )
-    created = existing is None
-    attachment_ids = [
-        kb.store_attachment_bytes(
-            conn,
-            task_id,
-            path.name,
-            path.read_bytes(),
-            content_type=None,
-            uploaded_by=received_by,
-            board=board,
-        )
-        for path in paths
-    ]
+    body = render_envelope(envelope)
+    task_id, created = kb.create_governed_intake_task(
+        conn,
+        title=title,
+        body=body,
+        tenant=envelope.tenant_domain,
+        content_digest=envelope.content_digest,
+        idempotency_key=envelope.idempotency_key,
+        created_by=received_by,
+        priority=priority,
+    )
     if created:
-        body = _legacy_envelope(
-            kind=kind,
-            raw_ref_sha256=digest,
-            received_by=received_by,
-            text=text,
-            attachment_ids=attachment_ids,
-        )
+        attachment_ids = [
+            kb.store_attachment_bytes(
+                conn,
+                task_id,
+                path.name,
+                path.read_bytes(),
+                content_type=None,
+                uploaded_by=received_by,
+                board=board,
+            )
+            for path in paths
+        ]
         with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, task_id))
             kb._append_event(conn, task_id, "intake_received", {
                 "schema_version": 1,
                 "actor": received_by,
@@ -290,8 +298,8 @@ def receive(
                 "correlation_id": key,
                 "intake_id": task_id,
                 "source_type": kind,
-                "source_ref_hash": digest,
-                "raw_ref_sha256": digest,
+                "source_ref_hash": envelope.content_digest,
+                "raw_ref_sha256": envelope.content_digest,
                 "provenance_refs": attachment_ids,
                 "attachment_ids": attachment_ids,
                 "idempotency_key": key,

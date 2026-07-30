@@ -3608,6 +3608,31 @@ def add_comment(
         return int(cur.lastrowid or 0)
 
 
+def add_governed_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str
+) -> int:
+    """Add a comment and recognize the structured PPMA scope contract."""
+    task = get_task(conn, task_id)
+    parsed_scope = parse_linear_scope(body)
+    if task is not None and is_ppma_scope_gate(conn, task_id) and parsed_scope is not None:
+        record_scope_handoff(conn, task_id, author=author, body=body)
+        comment = conn.execute(
+            "SELECT id FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return int(comment["id"] if comment else 0)
+    if (
+        task is not None
+        and is_ppma_scope_gate(conn, task_id)
+        and "LINEAR_SCOPE:" in body
+    ):
+        raise ValueError(
+            "PPMA scope handoff must contain LINEAR_SCOPE with at least one "
+            "{key, cptc} technical sub-issue"
+        )
+    return add_comment(conn, task_id, author, body)
+
+
 _LINEAR_SCOPE_RE = re.compile(
     r"LINEAR_SCOPE:\s*parent=(?P<parent>[A-Z][A-Z0-9]+-\d+)\s+"
     r"subissues=\[(?P<subissues>.+)\]",
@@ -3655,7 +3680,7 @@ def record_scope_handoff(
         ).fetchone()
         if task is None:
             raise ValueError(f"unknown task {task_id}")
-        if task["assignee"] != "paul-park":
+        if task["assignee"] != "paul-park" or not is_ppma_scope_gate(conn, task_id):
             raise ValueError("scope handoff is only valid for a PPMA gate task")
         existing = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'scope_recorded'",
@@ -3668,20 +3693,55 @@ def record_scope_handoff(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
+        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         payload = {"schema_version": 1, **scope, "recorded_by": author.strip()}
         _append_event(conn, task_id, "scope_recorded", payload)
-        _append_event(
-            conn,
-            task_id,
-            "handoff_emitted",
-            {
-                "schema_version": 1,
-                "handoff_kind": "linear_scope",
-                "downstream_task_ids": child_ids(conn, task_id),
-                "scope_parent": scope["parent"],
-            },
-        )
+        gate_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'ppma_scope_gate' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        gate_payload = json.loads(gate_event["payload"] or "{}") if gate_event else {}
+        root_task_id = gate_payload.get("root_task_id")
+        downstream = conn.execute(
+            "SELECT t.id, t.assignee FROM tasks t "
+            "JOIN task_links l ON l.child_id = t.id "
+            "WHERE l.parent_id = ? AND t.id != ? ORDER BY t.id",
+            (task_id, root_task_id or ""),
+        ).fetchall()
+        for child in downstream:
+            _append_event(
+                conn,
+                child["id"],
+                "handoff_emitted",
+                {
+                    "schema_version": 1,
+                    "actor": author.strip(),
+                    "source": "ppma_scope_gate",
+                    "correlation_id": root_task_id or task_id,
+                    "handoff_id": f"{task_id}:{child['id']}:linear_scope",
+                    "from_owner": "paul-park",
+                    "to_owner": child["assignee"],
+                    "artifact_refs": [
+                        scope["parent"],
+                        *[item["key"] for item in scope["subissues"]],
+                    ],
+                    "acceptance_contract": "validated_linear_scope",
+                    "next_expected_event": "handoff_accepted",
+                    "due_by": None,
+                    "scope_parent": scope["parent"],
+                },
+            )
     return scope
+
+
+def is_ppma_scope_gate(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether this task is the marked task-0 PPMA scope gate."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'ppma_scope_gate' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -5032,6 +5092,28 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # A decomposed task-0 scope gate is not complete until PPMA records the
+    # structured Linear/CPTC scope. This check sits in the shared DB writer so
+    # CLI, tools, dashboard, and administrative callers cannot bypass it.
+    if is_ppma_scope_gate(conn, task_id):
+        scope = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'scope_recorded' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if scope is None:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_scope",
+                    {
+                        "schema_version": 1,
+                        "reason": "scope_recorded_required",
+                    },
+                )
+            return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -6458,6 +6540,17 @@ def decompose_triage_task(
                  "domain": child.get("domain") or "UNKNOWN",
                  "created_by": author or "decomposer"},
             )
+            if idx == 0 and child.get("ppma_scope_gate") is True:
+                _append_event(
+                    conn,
+                    new_id,
+                    "ppma_scope_gate",
+                    {
+                        "schema_version": 1,
+                        "root_task_id": task_id,
+                        "gate_index": 0,
+                    },
+                )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
 
@@ -6603,6 +6696,16 @@ def create_governed_intake_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    # A PPMA task-0 gate must not be bypassed through archive because archived
+    # parents satisfy dependency readiness just like done parents.
+    if is_ppma_scope_gate(conn, task_id):
+        scope = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'scope_recorded' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if scope is None:
+            return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -6662,8 +6765,18 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     This keeps the operation atomic (single ``write_txn``).
 
     Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
+    if the task was not found or is an unsatisfied PPMA scope gate.
     """
+    # Deleting an unsatisfied PPMA gate would remove its dependency edges, and
+    # the trailing recompute would incorrectly make execution children ready.
+    if is_ppma_scope_gate(conn, task_id):
+        scope = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'scope_recorded' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if scope is None:
+            return False
     with write_txn(conn):
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:

@@ -403,6 +403,14 @@ def _validate_children(
                 reason = "required_certification_unverified"
         if resolved not in certifications:
             raise ValueError(f"tasks[{idx}] resolved to missing profile {resolved!r}")
+        if (
+            required_certification
+            and required_certification not in certifications.get(resolved, set())
+        ):
+            raise ValueError(
+                f"tasks[{idx}] final assignee {resolved!r} does not hold "
+                f"required certification {required_certification!r}"
+            )
 
         children.append({
             "title": title.strip()[:200],
@@ -411,6 +419,7 @@ def _validate_children(
             "parents": parents,
             "domain": domain,
             "required_certification": required_certification,
+            "ppma_scope_gate": idx == 0,
         })
         decisions.append({
             "index": idx,
@@ -442,6 +451,110 @@ def _validate_children(
     return children, decisions
 
 
+def _validate_single_assignee(
+    parsed: dict,
+    *,
+    cfg: dict,
+    task: kb.Task,
+    envelope: Optional[kanban_intake.IntakeEnvelope],
+    certifications: dict[str, set[str]],
+) -> tuple[str, dict]:
+    """Validate the final assignee for a true one-item intake."""
+    if _PPMA_PROFILE not in certifications:
+        raise ValueError("required PPMA profile 'paul-park' is not installed")
+    if envelope and task.tenant and envelope.tenant_domain != task.tenant:
+        raise ValueError("intake envelope tenant_domain does not match the task tenant")
+
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    allowed_assignees = set(certifications)
+    configured_assignees = kanban_cfg.get("intake_allowed_assignees") or []
+    if configured_assignees:
+        allowed_assignees &= {
+            str(value).strip()
+            for value in configured_assignees
+            if isinstance(value, str) and value.strip()
+        }
+        allowed_assignees.add(_PPMA_PROFILE)
+
+    requested = parsed.get("assignee")
+    requested_name = requested.strip() if isinstance(requested, str) else None
+    required_certification = (
+        str(parsed.get("required_certification") or "").strip() or None
+    )
+    resolved = requested_name
+    reason = "validated"
+    if not resolved or resolved not in allowed_assignees:
+        resolved = _PPMA_PROFILE
+        reason = "ambiguous_or_disallowed_assignee"
+    if required_certification:
+        if required_certification not in certifications.get(resolved, set()):
+            resolved = _PPMA_PROFILE
+            reason = "required_certification_unverified"
+        if required_certification not in certifications.get(resolved, set()):
+            raise ValueError(
+                f"final assignee {resolved!r} does not hold required "
+                f"certification {required_certification!r}"
+            )
+    return resolved, {
+        "requested_assignee": requested,
+        "resolved_assignee": resolved,
+        "required_certification": required_certification,
+        "reason": reason,
+    }
+
+
+def _multi_item_fallback_graph(
+    envelope: kanban_intake.IntakeEnvelope,
+    task: kb.Task,
+) -> list[dict]:
+    """Fail safely when advisory model output declines mandatory fan-out."""
+    children = [{
+        "title": f"Scope {task.title or 'raw intake'}",
+        "body": (
+            "The model declined mandatory fan-out for a canonical multi-item "
+            "intake. Scope every raw item into Linear and record LINEAR_SCOPE."
+        ),
+        "assignee": _PPMA_PROFILE,
+        "domain": "program-management",
+        "required_certification": "helios-agent-ppma",
+        "parents": [],
+    }]
+    for index, item in enumerate(envelope.items, start=1):
+        children.append({
+            "title": f"Route intake item {index}",
+            "body": (
+                f"Raw intake item:\n{item}\n\n"
+                "Assignment remained ambiguous after model decomposition. "
+                "PPMA must route it explicitly; do not infer an execution owner."
+            ),
+            "assignee": _PPMA_PROFILE,
+            "domain": envelope.tenant_domain,
+            "required_certification": None,
+            "parents": [0],
+        })
+    return children
+
+
+def _record_validation_failure(task_id: str, reason: str, *, author: str) -> None:
+    """Persist a bounded validation failure for watcher/operator diagnosis."""
+    try:
+        with kb.connect_closing() as conn:
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn,
+                    task_id,
+                    "intake_validation_failed",
+                    {
+                        "schema_version": 1,
+                        "actor": author,
+                        "source": "decomposer",
+                        "reason": reason,
+                    },
+                )
+    except Exception:
+        logger.exception("decompose: failed to record validation failure for %s", task_id)
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -471,7 +584,13 @@ def decompose_task(
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
     roster, certifications = _build_roster()
     valid_names = set(certifications)
-    envelope = kanban_intake.parse_envelope(task.body)
+    audit_author = author or _profile_author()
+    try:
+        envelope = kanban_intake.parse_envelope(task.body)
+    except ValueError as exc:
+        reason = f"invalid intake envelope: {exc}"
+        _record_validation_failure(task_id, reason, author=audit_author)
+        return DecomposeOutcome(task_id, False, reason)
 
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
@@ -518,7 +637,42 @@ def decompose_task(
         return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
 
     fanout = bool(parsed.get("fanout"))
-    audit_author = author or _profile_author()
+
+    if not fanout:
+        if envelope and len(envelope.items) > 1:
+            fanout = True
+            parsed["tasks"] = _multi_item_fallback_graph(envelope, task)
+            parsed["rationale"] = "mandatory_multi_item_fanout"
+        elif envelope:
+            try:
+                resolved_assignee, routing_decision = _validate_single_assignee(
+                    parsed,
+                    cfg=cfg,
+                    task=task,
+                    envelope=envelope,
+                    certifications=certifications,
+                )
+            except ValueError as exc:
+                reason = f"post-LLM validation failed: {exc}"
+                _record_validation_failure(task_id, reason, author=audit_author)
+                return DecomposeOutcome(task_id, False, reason)
+        else:
+            requested = parsed.get("assignee")
+            resolved_assignee = task.assignee or _normalize_assignee_choice(
+                requested,
+                default_assignee=default_assignee,
+                valid_names=valid_names,
+            )
+            routing_decision = {
+                "requested_assignee": requested,
+                "resolved_assignee": resolved_assignee,
+                "required_certification": None,
+                "reason": (
+                    "validated"
+                    if requested == resolved_assignee
+                    else "legacy_default_assignee"
+                ),
+            }
 
     if not fanout:
         # Fall back to single-task spec promotion (same effect as specify).
@@ -526,13 +680,7 @@ def decompose_task(
         new_body = parsed.get("body")
         title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
         body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
-        assignee_val = None
-        if not task.assignee:
-            assignee_val = _normalize_assignee_choice(
-                parsed.get("assignee"),
-                default_assignee=default_assignee,
-                valid_names=valid_names,
-            )
+        assignee_val = resolved_assignee if not task.assignee else None
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
@@ -550,6 +698,55 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
+        with kb.connect_closing() as conn:
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn,
+                    task_id,
+                    "intake_classified",
+                    {
+                        "schema_version": 1,
+                        "actor": audit_author,
+                        "source": "decomposer",
+                        "correlation_id": task_id,
+                        "intake_id": task_id,
+                        "domain": envelope.tenant_domain if envelope else "UNKNOWN",
+                        "classification": "single_task",
+                    },
+                )
+                kb._append_event(
+                    conn,
+                    task_id,
+                    "routing_decided",
+                    {
+                        "schema_version": 1,
+                        "actor": audit_author,
+                        "source": "decomposer",
+                        "correlation_id": task_id,
+                        "intake_id": task_id,
+                        "task_id": task_id,
+                        **routing_decision,
+                        "fallback_used": routing_decision["reason"] != "validated",
+                        "profile_exists": routing_decision["resolved_assignee"] in valid_names,
+                    },
+                )
+                kb._append_event(
+                    conn,
+                    task_id,
+                    "decomposition_decided",
+                    {
+                        "schema_version": 1,
+                        "actor": audit_author,
+                        "source": "decomposer",
+                        "correlation_id": task_id,
+                        "intake_id": task_id,
+                        "root_task_id": task_id,
+                        "fanout": False,
+                        "child_ids": [],
+                        "dependency_edges": [],
+                        "rationale_code": "single_task",
+                    },
+                )
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False, new_title=title_val,
@@ -570,7 +767,9 @@ def decompose_task(
             certifications=certifications,
         )
     except ValueError as exc:
-        return DecomposeOutcome(task_id, False, f"post-LLM validation failed: {exc}")
+        reason = f"post-LLM validation failed: {exc}"
+        _record_validation_failure(task_id, reason, author=audit_author)
+        return DecomposeOutcome(task_id, False, reason)
 
     try:
         with kb.connect_closing() as conn:
@@ -598,28 +797,55 @@ def decompose_task(
             kb._append_event(
                 conn,
                 task_id,
-                "scope_recorded",
+                "intake_classified",
                 {
                     "schema_version": 1,
-                    "scope_source": "intake_envelope" if envelope else "decomposer",
-                    "content_digest": envelope.content_digest if envelope else None,
-                    "tenant_domain": envelope.tenant_domain if envelope else task.tenant,
-                    "sensitivity": envelope.sensitivity if envelope else None,
-                    "validated_child_count": len(child_ids),
+                    "actor": audit_author,
+                    "source": "decomposer",
+                    "correlation_id": task_id,
+                    "intake_id": task_id,
+                    "domain": envelope.tenant_domain if envelope else task.tenant or "UNKNOWN",
+                    "classification": "fanout",
                 },
             )
             for child_id, decision in zip(child_ids, routing_decisions):
                 kb._append_event(
                     conn,
                     child_id,
-                    "handoff_emitted",
+                    "routing_decided",
                     {
                         "schema_version": 1,
-                        "handoff_kind": "domain_execution",
-                        "routing": decision,
-                        "parent_gate_index": 0,
+                        "actor": audit_author,
+                        "source": "decomposer",
+                        "correlation_id": task_id,
+                        "intake_id": task_id,
+                        "task_id": child_id,
+                        **decision,
+                        "fallback_used": decision["reason"] != "validated",
+                        "profile_exists": decision["resolved_assignee"] in valid_names,
                     },
                 )
+            kb._append_event(
+                conn,
+                task_id,
+                "decomposition_decided",
+                {
+                    "schema_version": 1,
+                    "actor": audit_author,
+                    "source": "decomposer",
+                    "correlation_id": task_id,
+                    "intake_id": task_id,
+                    "root_task_id": task_id,
+                    "fanout": True,
+                    "child_ids": child_ids,
+                    "dependency_edges": [
+                        {"parent_index": parent, "child_index": index}
+                        for index, child in enumerate(children)
+                        for parent in child.get("parents", [])
+                    ],
+                    "rationale_code": parsed.get("rationale") or "fanout",
+                },
+            )
 
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",

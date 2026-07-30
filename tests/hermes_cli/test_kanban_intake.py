@@ -31,7 +31,11 @@ def test_paragraph_intake_is_idempotent_and_emits_one_typed_event(kanban_home):
     assert created_again is False
     assert second == first
     assert task.status == "triage"
-    assert "intake_source_type: paragraph" in task.body
+    envelope = kanban_intake.parse_envelope(task.body)
+    assert envelope is not None
+    assert envelope.source == "cli:haa"
+    assert envelope.items == ("Build the telemetry contract",)
+    assert envelope.content_digest
     intake_events = [event for event in events if event.kind == "intake_received"]
     assert len(intake_events) == 1
     assert intake_events[0].payload["idempotency_key"] == task.idempotency_key
@@ -46,7 +50,9 @@ def test_linear_url_shape_and_url_normalization_deduplicate(kanban_home):
         second, _ = kanban_intake.receive(conn, text=lower, received_by="haa")
         task = kb.get_task(conn, first)
     assert first == second
-    assert "intake_source_type: linear_url" in task.body
+    envelope = kanban_intake.parse_envelope(task.body)
+    assert envelope is not None
+    assert envelope.items == (lower,)
 
 
 def test_same_file_content_from_two_paths_deduplicates_attachment(kanban_home, tmp_path):
@@ -69,3 +75,19 @@ def test_cli_intake_returns_machine_readable_task(kanban_home):
     assert payload["created"] is True
     assert payload["status"] == "triage"
     assert payload["idempotency_key"]
+
+
+def test_url_pile_intake_preserves_item_cardinality(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id, _ = kanban_intake.receive(
+            conn,
+            text="https://example.com/one\nhttps://example.com/two",
+            received_by="haa",
+        )
+        task = kb.get_task(conn, task_id)
+    envelope = kanban_intake.parse_envelope(task.body)
+    assert envelope is not None
+    assert envelope.items == (
+        "https://example.com/one",
+        "https://example.com/two",
+    )

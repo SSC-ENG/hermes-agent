@@ -2147,16 +2147,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kb.connect_closing() as conn:
-        task = kb.get_task(conn, args.task_id)
-        if task and task.assignee == "paul-park" and body.startswith("LINEAR_SCOPE:"):
-            kb.record_scope_handoff(
-                conn,
-                args.task_id,
-                author=author,
-                body=body,
-            )
-        else:
-            kb.add_comment(conn, args.task_id, author, body)
+        kb.add_governed_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
     return 0
 

@@ -879,7 +879,7 @@ def _handle_comment(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            cid = kb.add_governed_comment(conn, tid, author=author, body=str(body))
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()

@@ -342,6 +342,52 @@ def test_add_comment(client):
     assert comments[0]["author"] == "teknium"
 
 
+def test_dashboard_comment_records_linear_scope_for_ppma_gate(client):
+    root = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "raw", "triage": True},
+    ).json()["task"]
+    with kb.connect_closing() as conn:
+        gate, execution = kb.decompose_triage_task(
+            conn,
+            root["id"],
+            root_assignee="paul-park",
+            children=[
+                {
+                    "title": "scope",
+                    "assignee": "paul-park",
+                    "parents": [],
+                    "domain": "program-management",
+                    "ppma_scope_gate": True,
+                },
+                {
+                    "title": "build",
+                    "assignee": "cole-espinoza",
+                    "parents": [0],
+                    "domain": "engineering",
+                },
+            ],
+        )
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{gate}/comments",
+        json={
+            "author": "paul-park",
+            "body": (
+                "LINEAR_SCOPE: parent=HEL-3107 "
+                "subissues=[{key:HEL-3115, cptc:3}]"
+            ),
+        },
+    )
+    assert response.status_code == 200
+    with kb.connect_closing() as conn:
+        assert "scope_recorded" in {
+            event.kind for event in kb.list_events(conn, gate)
+        }
+        assert "handoff_emitted" in {
+            event.kind for event in kb.list_events(conn, execution)
+        }
+
+
 # ---------------------------------------------------------------------------
 # Dispatch nudge
 # ---------------------------------------------------------------------------
