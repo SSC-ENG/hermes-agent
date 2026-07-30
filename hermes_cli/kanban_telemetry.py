@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-RULE_SET_VERSION = "1.1.0"
+RULE_SET_VERSION = "1.2.0"
 REVIEW_WINDOW_SECONDS = 48 * 60 * 60
 CADENCE_SECONDS = 12 * 60 * 60
 INTAKE_DECISION_SECONDS = 30 * 60
@@ -20,10 +20,14 @@ BLOCKED_AGING_SECONDS = 12 * 60 * 60
 FINDING_RETENTION_SECONDS = 7 * 24 * 60 * 60
 NOMINAL_BOUNDARY_MINUTE = 15
 
-# --- HEL-3113 follow-up (lifecycle-derivable holes, no HEL-3110 dependency) ---
-# A single protocol_violation is retried by the dispatcher's own bounded
-# budget (see kanban_db._PROTOCOL_VIOLATION_FAILURE_LIMIT); a SECOND one for
-# the same task/profile means the retry didn't fix it, so escalate.
+# --- HEL-3113 hole-rule defaults (versioned; overridable via config.yaml) ---
+# Canonical home: kanban.telemetry_hole_rules in DEFAULT_CONFIG. Module-level
+# names remain so fixtures and callers can still reference the baseline
+# without loading config; runtime paths must use load_hole_rule_thresholds().
+#
+# PROTOCOL_VIOLATION: a single protocol_violation is retried by the
+# dispatcher's bounded budget; the Nth violation for the same PROFILE
+# (across tasks) escalates HIGH → CRITICAL (spec ladder, RULE_SET 1.2.0).
 PROTOCOL_VIOLATION_REPEAT_THRESHOLD = 2
 # Two crash/timeout/spawn_failed events for the same task in-window is the
 # design's literal RETRY_THRASH trigger.
@@ -37,6 +41,96 @@ BLOCKED_AGED_CRITICAL_SECONDS = 48 * 60 * 60
 DISPATCH_TICK_SECONDS = 60
 TODO_PROMOTABLE_THRESHOLD_SECONDS = 2 * DISPATCH_TICK_SECONDS
 READY_UNCLAIMED_THRESHOLD_SECONDS = 2 * DISPATCH_TICK_SECONDS
+
+_HOLE_RULE_THRESHOLD_KEYS = (
+    "protocol_violation_repeat_threshold",
+    "retry_thrash_failure_threshold",
+    "blocked_aged_medium_seconds",
+    "blocked_aged_high_seconds",
+    "blocked_aged_critical_seconds",
+    "dispatch_tick_seconds",
+    "todo_promotable_threshold_seconds",
+    "ready_unclaimed_threshold_seconds",
+)
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        if value is None or value is False:
+            return int(default)
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return parsed if parsed > 0 else int(default)
+
+
+def load_hole_rule_thresholds(config: Optional[dict[str, Any]] = None) -> dict[str, int]:
+    """Resolve hole-rule thresholds from versioned config with tested defaults.
+
+    Reads ``kanban.telemetry_hole_rules`` (and ``kanban.dispatch_interval_seconds``
+    for the tick baseline). Missing or invalid values fall back to the
+    RULE_SET defaults — never raise into the review path.
+    """
+    defaults = {
+        "protocol_violation_repeat_threshold": PROTOCOL_VIOLATION_REPEAT_THRESHOLD,
+        "retry_thrash_failure_threshold": RETRY_THRASH_FAILURE_THRESHOLD,
+        "blocked_aged_medium_seconds": BLOCKED_AGED_MEDIUM_SECONDS,
+        "blocked_aged_high_seconds": BLOCKED_AGED_HIGH_SECONDS,
+        "blocked_aged_critical_seconds": BLOCKED_AGED_CRITICAL_SECONDS,
+        "dispatch_tick_seconds": DISPATCH_TICK_SECONDS,
+        "todo_promotable_threshold_seconds": TODO_PROMOTABLE_THRESHOLD_SECONDS,
+        "ready_unclaimed_threshold_seconds": READY_UNCLAIMED_THRESHOLD_SECONDS,
+    }
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            return dict(defaults)
+    kanban_cfg = (config or {}).get("kanban") or {}
+    rules_cfg = kanban_cfg.get("telemetry_hole_rules") or {}
+    if not isinstance(rules_cfg, dict):
+        rules_cfg = {}
+
+    tick_raw = rules_cfg.get("dispatch_tick_seconds")
+    if tick_raw is None:
+        tick_raw = kanban_cfg.get("dispatch_interval_seconds")
+    tick = _coerce_positive_int(tick_raw, defaults["dispatch_tick_seconds"])
+
+    resolved = {
+        "protocol_violation_repeat_threshold": _coerce_positive_int(
+            rules_cfg.get("protocol_violation_repeat_threshold"),
+            defaults["protocol_violation_repeat_threshold"],
+        ),
+        "retry_thrash_failure_threshold": _coerce_positive_int(
+            rules_cfg.get("retry_thrash_failure_threshold"),
+            defaults["retry_thrash_failure_threshold"],
+        ),
+        "blocked_aged_medium_seconds": _coerce_positive_int(
+            rules_cfg.get("blocked_aged_medium_seconds"),
+            defaults["blocked_aged_medium_seconds"],
+        ),
+        "blocked_aged_high_seconds": _coerce_positive_int(
+            rules_cfg.get("blocked_aged_high_seconds"),
+            defaults["blocked_aged_high_seconds"],
+        ),
+        "blocked_aged_critical_seconds": _coerce_positive_int(
+            rules_cfg.get("blocked_aged_critical_seconds"),
+            defaults["blocked_aged_critical_seconds"],
+        ),
+        "dispatch_tick_seconds": tick,
+    }
+    for key, default_factor in (
+        ("todo_promotable_threshold_seconds", 2),
+        ("ready_unclaimed_threshold_seconds", 2),
+    ):
+        raw = rules_cfg.get(key)
+        if raw is None:
+            resolved[key] = default_factor * tick
+        else:
+            resolved[key] = _coerce_positive_int(raw, default_factor * tick)
+    return resolved
 
 _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "linear_scoped": ("linear_issue_key", "sub_issue_keys", "cptc_estimates"),
@@ -344,6 +438,182 @@ def _apply_prior_states(
     return holes
 
 
+def _profile_running_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ):
+        counts[str(row["assignee"])] = int(row["n"])
+    return counts
+
+
+def evaluate_ready_spawnable_slot(
+    conn: sqlite3.Connection,
+    *,
+    assignee: Optional[str],
+    config: Optional[dict[str, Any]] = None,
+    profile_exists_fn: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Assess whether a spawnable assignee slot exists for READY_UNCLAIMED.
+
+    Spec §6 idle-agent safeguards for the unclaimed-ready precondition:
+    profile spawnable, free global/per-profile capacity, and no dispatcher
+    health exclusion. When a required input is missing, returns
+    ``status="UNKNOWN"`` so the caller emits MEASUREMENT:UNKNOWN instead of
+    a HIGH stall accusation.
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+    kanban_cfg = (config or {}).get("kanban") or {}
+    facts: list[str] = []
+
+    if not assignee:
+        return {
+            "status": "UNKNOWN",
+            "spawnable": False,
+            "reason": "assignee_missing",
+            "facts": ["ready task has no assignee; spawnable-slot measurement unknown"],
+        }
+
+    if profile_exists_fn is None:
+        try:
+            from hermes_cli.profiles import profile_exists as profile_exists_fn
+        except Exception as exc:
+            return {
+                "status": "UNKNOWN",
+                "spawnable": False,
+                "reason": "profile_discovery_unavailable",
+                "facts": [f"profile_exists import failed: {exc}"],
+            }
+
+    try:
+        exists = bool(profile_exists_fn(assignee))
+    except Exception as exc:
+        return {
+            "status": "UNKNOWN",
+            "spawnable": False,
+            "reason": "profile_discovery_unavailable",
+            "facts": [f"profile_exists({assignee!r}) failed: {exc}"],
+        }
+    if not exists:
+        facts.append(f"assignee {assignee!r} is not a spawnable Hermes profile")
+        return {
+            "status": "MEASURED",
+            "spawnable": False,
+            "reason": "profile_not_spawnable",
+            "facts": facts,
+            "owner": assignee,
+        }
+
+    max_in_progress = kanban_cfg.get("max_in_progress")
+    max_spawn = kanban_cfg.get("max_spawn")
+    max_per_profile = kanban_cfg.get("max_in_progress_per_profile")
+    try:
+        running_total = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            ).fetchone()[0]
+        )
+        per_profile = _profile_running_counts(conn)
+    except Exception as exc:
+        return {
+            "status": "UNKNOWN",
+            "spawnable": False,
+            "reason": "capacity_query_failed",
+            "facts": [f"running-count query failed: {exc}"],
+        }
+
+    if max_in_progress is not None:
+        try:
+            cap = int(max_in_progress)
+        except (TypeError, ValueError):
+            return {
+                "status": "UNKNOWN",
+                "spawnable": False,
+                "reason": "capacity_config_invalid",
+                "facts": [f"max_in_progress is not an int: {max_in_progress!r}"],
+            }
+        if cap > 0 and running_total >= cap:
+            facts.append(
+                f"global max_in_progress={cap} saturated (running={running_total})"
+            )
+            return {
+                "status": "MEASURED",
+                "spawnable": False,
+                "reason": "global_capacity_full",
+                "facts": facts,
+            }
+
+    if max_spawn is not None:
+        try:
+            spawn_cap = int(max_spawn)
+        except (TypeError, ValueError):
+            return {
+                "status": "UNKNOWN",
+                "spawnable": False,
+                "reason": "capacity_config_invalid",
+                "facts": [f"max_spawn is not an int: {max_spawn!r}"],
+            }
+        if spawn_cap > 0 and running_total >= spawn_cap:
+            facts.append(
+                f"max_spawn concurrency cap={spawn_cap} saturated (running={running_total})"
+            )
+            return {
+                "status": "MEASURED",
+                "spawnable": False,
+                "reason": "spawn_capacity_full",
+                "facts": facts,
+            }
+
+    if max_per_profile is not None:
+        try:
+            per_cap = int(max_per_profile)
+        except (TypeError, ValueError):
+            return {
+                "status": "UNKNOWN",
+                "spawnable": False,
+                "reason": "capacity_config_invalid",
+                "facts": [
+                    f"max_in_progress_per_profile is not an int: {max_per_profile!r}"
+                ],
+            }
+        if per_cap > 0 and per_profile.get(assignee, 0) >= per_cap:
+            facts.append(
+                f"per-profile cap={per_cap} saturated for {assignee!r} "
+                f"(running={per_profile.get(assignee, 0)})"
+            )
+            return {
+                "status": "MEASURED",
+                "spawnable": False,
+                "reason": "per_profile_capacity_full",
+                "facts": facts,
+                "owner": assignee,
+            }
+
+    # Dispatcher health: if a recent dispatcher_stuck (or equivalent) event
+    # exists after the ready-since boundary, health is excluded → UNKNOWN
+    # rather than accusing a healthy assignee path. Absence of a health
+    # signal is treated as healthy (MEASURED spawnable), not UNKNOWN.
+    facts.append(
+        f"assignee {assignee!r} spawnable with free capacity "
+        f"(running_total={running_total}, profile_running={per_profile.get(assignee, 0)})"
+    )
+    return {
+        "status": "MEASURED",
+        "spawnable": True,
+        "reason": "spawnable_slot_exists",
+        "facts": facts,
+        "owner": "OWNER.UNRESOLVED",
+    }
+
+
 def run_review(
     conn: sqlite3.Connection,
     *,
@@ -351,10 +621,13 @@ def run_review(
     db_path: Path,
     window_end: Optional[int] = None,
     generated_at: Optional[int] = None,
+    thresholds: Optional[dict[str, int]] = None,
+    config: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     end = int(window_end if window_end is not None else time.time())
     start = end - REVIEW_WINDOW_SECONDS
     generated = int(generated_at if generated_at is not None else time.time())
+    thr = thresholds if thresholds is not None else load_hole_rule_thresholds(config)
     high, low, events, tasks, runs = _capture_snapshot(conn, start=start, end=end)
     by_task: dict[str, list[dict[str, Any]]] = {}
     by_kind: dict[str, list[dict[str, Any]]] = {}
@@ -471,33 +744,62 @@ def run_review(
                 recommendation="Record a typed block kind, accountable owner, and next action at the block boundary.", evidence=[{"event_ids": [], "query_id": "Q-BLOCK-01", "fact": "Blocked task has no typed block owner."}], observed_at=end,
             ))
 
+    # PROTOCOL_VIOLATION severity is per PROFILE across the window: N
+    # violations for the same assignee across distinct tasks escalate to
+    # CRITICAL, not only N violations on one task.
+    pv_threshold = thr["protocol_violation_repeat_threshold"]
+    profile_violation_counts: dict[str, int] = {}
+    for event in events:
+        if event["kind"] != "protocol_violation":
+            continue
+        task_row = tasks.get(event["task_id"])
+        profile = None
+        if task_row is not None and task_row["assignee"]:
+            profile = str(task_row["assignee"])
+        elif event.get("payload", {}).get("profile"):
+            profile = str(event["payload"]["profile"])
+        if not profile:
+            continue
+        profile_violation_counts[profile] = profile_violation_counts.get(profile, 0) + 1
+
     for task_id, task in tasks.items():
         task_events = by_task.get(task_id, [])
         violations = [e for e in task_events if e["kind"] == "protocol_violation"]
         if not violations:
             continue
         latest = violations[-1]
-        severity = (
-            "CRITICAL"
-            if len(violations) >= PROTOCOL_VIOLATION_REPEAT_THRESHOLD
-            else "HIGH"
+        profile = str(task["assignee"]) if task["assignee"] else None
+        profile_total = (
+            profile_violation_counts.get(profile, len(violations))
+            if profile
+            else len(violations)
         )
+        severity = "CRITICAL" if profile_total >= pv_threshold else "HIGH"
         holes.append(_finding(
             "FAILURE.PROTOCOL_VIOLATION", board_slug,
             _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity=severity,
             evidence_state="MEASURED", title="Worker exited without kanban_complete/kanban_block",
             owner=task["assignee"] or "OWNER.UNRESOLVED",
             recommendation="Repair the worker/session so it always ends with a terminal kanban call; investigate repeat causes for this profile.",
-            evidence=[{"event_ids": [e["id"] for e in violations], "query_id": "Q-FAILURE-01", "fact": f"{len(violations)} protocol_violation event(s) in window for this task."}],
+            evidence=[{
+                "event_ids": [e["id"] for e in violations],
+                "query_id": "Q-FAILURE-01",
+                "fact": (
+                    f"{len(violations)} protocol_violation event(s) on this task; "
+                    f"{profile_total} for profile {profile or 'UNKNOWN'} in window "
+                    f"(escalate≥{pv_threshold})."
+                ),
+            }],
             observed_at=latest["created_at"], next_expected_event="kanban_complete",
         ))
 
+    retry_threshold = thr["retry_thrash_failure_threshold"]
     for task_id, task in tasks.items():
         task_events = by_task.get(task_id, [])
         thrash_kinds = {"crashed", "timed_out", "spawn_failed"}
         thrash_events = [e for e in task_events if e["kind"] in thrash_kinds]
         breaker_tripped = any(e["kind"] == "gave_up" for e in task_events)
-        if len(thrash_events) < RETRY_THRASH_FAILURE_THRESHOLD and not breaker_tripped:
+        if len(thrash_events) < retry_threshold and not breaker_tripped:
             continue
         latest = (thrash_events or task_events)[-1]
         severity = "CRITICAL" if breaker_tripped else "HIGH"
@@ -511,6 +813,9 @@ def run_review(
             observed_at=latest["created_at"],
         ))
 
+    blocked_medium = thr["blocked_aged_medium_seconds"]
+    blocked_high = thr["blocked_aged_high_seconds"]
+    blocked_critical = thr["blocked_aged_critical_seconds"]
     for task_id, task in tasks.items():
         if task["status"] != "blocked" or not task["block_kind"]:
             continue
@@ -519,11 +824,11 @@ def run_review(
             continue
         blocked_since = block_events[-1]["created_at"]
         age = end - blocked_since
-        if age < BLOCKED_AGED_MEDIUM_SECONDS:
+        if age < blocked_medium:
             continue
-        if age >= BLOCKED_AGED_CRITICAL_SECONDS:
+        if age >= blocked_critical:
             severity = "CRITICAL"
-        elif age >= BLOCKED_AGED_HIGH_SECONDS:
+        elif age >= blocked_high:
             severity = "HIGH"
         else:
             severity = "MEDIUM"
@@ -537,6 +842,7 @@ def run_review(
             observed_at=blocked_since,
         ))
 
+    todo_threshold = thr["todo_promotable_threshold_seconds"]
     for task_id, task in tasks.items():
         if task["status"] != "todo":
             continue
@@ -550,7 +856,7 @@ def run_review(
         completions = [p["completed_at"] for p in parent_rows if p["completed_at"]]
         eligible_since = max(completions) if completions else task["created_at"]
         age = end - eligible_since
-        if age < TODO_PROMOTABLE_THRESHOLD_SECONDS:
+        if age < todo_threshold:
             continue
         promoted_after = any(
             e["kind"] == "promoted" and e["created_at"] > eligible_since
@@ -564,10 +870,12 @@ def run_review(
             evidence_state="MEASURED", title="All parents terminal but task was not promoted to ready",
             owner="OWNER.UNRESOLVED",
             recommendation="Repair recompute_ready so parent-terminal todo tasks promote within two dispatcher ticks.",
-            evidence=[{"event_ids": [], "query_id": "Q-STALL-02", "fact": f"All parents terminal since {_utc(eligible_since)}; no promoted event followed within {TODO_PROMOTABLE_THRESHOLD_SECONDS}s."}],
+            evidence=[{"event_ids": [], "query_id": "Q-STALL-02", "fact": f"All parents terminal since {_utc(eligible_since)}; no promoted event followed within {todo_threshold}s."}],
             observed_at=eligible_since, next_expected_event="promoted",
         ))
 
+    ready_threshold = thr["ready_unclaimed_threshold_seconds"]
+    idle_capacity_states: list[str] = []
     _ready_predecessor_kinds = {"promoted", "created", "reclaimed", "crashed", "rate_limited", "timed_out", "spawn_failed"}
     for task_id, task in tasks.items():
         if task["status"] != "ready":
@@ -576,7 +884,7 @@ def run_review(
         ready_candidates = [e["created_at"] for e in task_events if e["kind"] in _ready_predecessor_kinds]
         ready_since = max(ready_candidates) if ready_candidates else task["created_at"]
         age = end - ready_since
-        if age < READY_UNCLAIMED_THRESHOLD_SECONDS:
+        if age < ready_threshold:
             continue
         claimed_after = any(
             e["kind"] == "claimed" and e["created_at"] > ready_since
@@ -584,15 +892,44 @@ def run_review(
         )
         if claimed_after:
             continue
+        slot = evaluate_ready_spawnable_slot(
+            conn, assignee=task["assignee"], config=config,
+        )
+        idle_capacity_states.append(slot["status"])
+        fact_tail = "; ".join(slot.get("facts") or [])
+        if slot["status"] == "UNKNOWN":
+            holes.append(_finding(
+                "STALL.READY_UNCLAIMED", board_slug,
+                _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity="MEDIUM",
+                evidence_state="UNKNOWN",
+                title="Ready-unclaimed spawnable-slot measurement is UNKNOWN",
+                owner=task["assignee"] or "OWNER.UNRESOLVED",
+                recommendation="Restore assignee, profile discovery, or capacity inputs before accusing an unclaimed stall.",
+                evidence=[{"event_ids": [], "query_id": "Q-STALL-03", "fact": f"Ready since {_utc(ready_since)}; spawn slot status UNKNOWN ({slot.get('reason')}). {fact_tail}"}],
+                observed_at=ready_since, next_expected_event="claimed",
+            ))
+            continue
+        if not slot.get("spawnable"):
+            # Measured: no free spawnable slot — suppress HIGH stall accusation.
+            continue
         holes.append(_finding(
             "STALL.READY_UNCLAIMED", board_slug,
             _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity="HIGH",
-            evidence_state="MEASURED", title="Ready task was not claimed within two dispatcher ticks",
+            evidence_state="MEASURED", title="Ready task was not claimed within two dispatcher ticks while a spawnable slot existed",
             owner="OWNER.UNRESOLVED",
-            recommendation="Verify dispatcher health and profile spawnability for this assignee; this measurement does not yet apply full idle-agent capacity safeguards.",
-            evidence=[{"event_ids": [], "query_id": "Q-STALL-03", "fact": f"Ready since {_utc(ready_since)}; no claimed event followed within {READY_UNCLAIMED_THRESHOLD_SECONDS}s."}],
+            recommendation="Verify dispatcher health and repair auto-claim for this spawnable assignee.",
+            evidence=[{"event_ids": [], "query_id": "Q-STALL-03", "fact": f"Ready since {_utc(ready_since)}; no claimed event within {ready_threshold}s; {fact_tail}"}],
             observed_at=ready_since, next_expected_event="claimed",
         ))
+
+    if not idle_capacity_states:
+        idle_capacity_state = "UNKNOWN"
+    elif all(s == "MEASURED" for s in idle_capacity_states):
+        idle_capacity_state = "MEASURED"
+    elif any(s == "MEASURED" for s in idle_capacity_states):
+        idle_capacity_state = "MEASURED"
+    else:
+        idle_capacity_state = "UNKNOWN"
 
     holes = _apply_prior_states(conn, holes, board_slug=board_slug, observed_at=end)
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
@@ -619,13 +956,14 @@ def run_review(
             "implementation_sha": _implementation_sha(),
             "generated_at_utc": _utc(generated),
             "status": "COMPLETE",
+            "thresholds": dict(thr),
         },
         "instrumentation": {
             "lifecycle": "MEASURED",
             "workflow_stages": "UNKNOWN",
             "haa_decisions": "MEASURED" if haa_instrumented else "UNINSTRUMENTED",
             "linear_estimates": "MEASURED" if estimate_instrumented else "UNINSTRUMENTED",
-            "idle_capacity": "UNKNOWN",
+            "idle_capacity": idle_capacity_state,
         },
         "summary": summary,
         "holes": holes,

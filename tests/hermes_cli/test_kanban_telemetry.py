@@ -18,6 +18,13 @@ def board(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # READY_UNCLAIMED safeguards call profile_exists; default profiles dir
+    # is empty in this fixture home, so treat any assignee as spawnable
+    # unless a test overrides the lookup.
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda name: bool(name),
+    )
     kb.init_db()
     return home
 
@@ -296,6 +303,122 @@ def test_ready_unclaimed_suppressed_after_claim(board):
         report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
     rule_ids = {h["rule_id"] for h in report["holes"]}
     assert "STALL.READY_UNCLAIMED" not in rule_ids
+
+
+def test_protocol_violation_escalates_across_tasks_for_same_profile(board):
+    """Spec ladder: CRITICAL on repeat per PROFILE, not only per task."""
+    end = 1_800_000_000
+    thr = telemetry.load_hole_rule_thresholds({})
+    with kb.connect_closing() as conn:
+        t1 = kb.create_task(conn, title="v1", assignee="felix-steele")
+        t2 = kb.create_task(conn, title="v2", assignee="felix-steele")
+        _insert_event(conn, t1, "protocol_violation", {"pid": 1}, end - 4000)
+        first = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end, thresholds=thr,
+        )
+        _insert_event(conn, t2, "protocol_violation", {"pid": 2}, end - 2000)
+        second = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end, thresholds=thr,
+        )
+    first_holes = [h for h in first["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION"]
+    second_holes = [h for h in second["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION"]
+    assert len(first_holes) == 1
+    assert first_holes[0]["severity"] == "HIGH"
+    assert len(second_holes) == 2
+    assert all(h["severity"] == "CRITICAL" for h in second_holes)
+
+
+def test_ready_unclaimed_unknown_when_profile_discovery_absent(board, monkeypatch):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+
+    def _boom(_name):
+        raise RuntimeError("profile catalog offline")
+
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", _boom)
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="unknown-slot", assignee="felix-steele")
+        _insert_event(conn, task, "created", {}, ready_since)
+        report = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end,
+        )
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.READY_UNCLAIMED")
+    assert hole["evidence_state"] == "UNKNOWN"
+    assert hole["severity"] != "HIGH"
+    assert task in hole["subject"]["task_ids"]
+
+
+def test_ready_unclaimed_suppressed_when_no_spawnable_slot(board, monkeypatch):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: False)
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="nonspawn", assignee="missing-profile")
+        _insert_event(conn, task, "created", {}, ready_since)
+        report = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end,
+        )
+    ready_holes = [h for h in report["holes"] if h["rule_id"] == "STALL.READY_UNCLAIMED"]
+    assert ready_holes == []
+
+
+def test_ready_unclaimed_suppressed_when_per_profile_capacity_full(board):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    cfg = {
+        "kanban": {
+            "max_in_progress_per_profile": 1,
+            "telemetry_hole_rules": {},
+        }
+    }
+    thr = telemetry.load_hole_rule_thresholds(cfg)
+    with kb.connect_closing() as conn:
+        running = kb.create_task(conn, title="busy", assignee="felix-steele")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (running,))
+        ready = kb.create_task(conn, title="waiting", assignee="felix-steele")
+        _insert_event(conn, ready, "created", {}, ready_since)
+        report = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end, thresholds=thr, config=cfg,
+        )
+    assert not any(h["rule_id"] == "STALL.READY_UNCLAIMED" for h in report["holes"])
+
+
+def test_hole_rule_thresholds_default_from_config_and_override():
+    defaults = telemetry.load_hole_rule_thresholds({})
+    assert defaults["protocol_violation_repeat_threshold"] == telemetry.PROTOCOL_VIOLATION_REPEAT_THRESHOLD
+    assert defaults["retry_thrash_failure_threshold"] == telemetry.RETRY_THRASH_FAILURE_THRESHOLD
+    assert defaults["blocked_aged_medium_seconds"] == telemetry.BLOCKED_AGED_MEDIUM_SECONDS
+    assert defaults["blocked_aged_high_seconds"] == telemetry.BLOCKED_AGED_HIGH_SECONDS
+    assert defaults["blocked_aged_critical_seconds"] == telemetry.BLOCKED_AGED_CRITICAL_SECONDS
+    assert defaults["dispatch_tick_seconds"] == telemetry.DISPATCH_TICK_SECONDS
+    assert defaults["todo_promotable_threshold_seconds"] == 2 * defaults["dispatch_tick_seconds"]
+    assert defaults["ready_unclaimed_threshold_seconds"] == 2 * defaults["dispatch_tick_seconds"]
+    assert telemetry.RULE_SET_VERSION == "1.2.0"
+
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    cfg_defaults = DEFAULT_CONFIG["kanban"]["telemetry_hole_rules"]
+    assert cfg_defaults["protocol_violation_repeat_threshold"] == 2
+    assert cfg_defaults["retry_thrash_failure_threshold"] == 2
+
+    override = telemetry.load_hole_rule_thresholds({
+        "kanban": {
+            "dispatch_interval_seconds": 30,
+            "telemetry_hole_rules": {
+                "protocol_violation_repeat_threshold": 3,
+                "ready_unclaimed_threshold_seconds": 90,
+            },
+        }
+    })
+    assert override["dispatch_tick_seconds"] == 30
+    assert override["todo_promotable_threshold_seconds"] == 60
+    assert override["ready_unclaimed_threshold_seconds"] == 90
+    assert override["protocol_violation_repeat_threshold"] == 3
 
 
 def test_persist_review_replay_preserves_dispositioned_verified_ledger(board, tmp_path):
