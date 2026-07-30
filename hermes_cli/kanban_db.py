@@ -84,7 +84,6 @@ import sys
 import threading
 import logging
 import time
-from datetime import datetime, timezone
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1245,8 +1244,6 @@ CREATE TABLE IF NOT EXISTS task_events (
     run_id     INTEGER,
     kind       TEXT NOT NULL,
     payload    TEXT,
-    work_intent_id TEXT,
-    idempotency_key TEXT,
     created_at INTEGER NOT NULL
 );
 
@@ -2482,14 +2479,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
-    if "work_intent_id" not in ev_cols:
-        _add_column_if_missing(
-            conn, "task_events", "work_intent_id", "work_intent_id TEXT"
-        )
-    if "idempotency_key" not in ev_cols:
-        _add_column_if_missing(
-            conn, "task_events", "idempotency_key", "idempotency_key TEXT"
-        )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -2497,10 +2486,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
-    )
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency "
-        "ON task_events(idempotency_key) WHERE idempotency_key IS NOT NULL"
     )
 
     notify_table_exists = conn.execute(
@@ -2614,13 +2599,10 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_events ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL,"
-        " payload TEXT, work_intent_id TEXT, idempotency_key TEXT,"
-        " created_at INTEGER NOT NULL)",
+        " payload TEXT, created_at INTEGER NOT NULL)",
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
-            "CREATE UNIQUE INDEX idx_events_idempotency "
-            "ON task_events(idempotency_key) WHERE idempotency_key IS NOT NULL",
         ),
     ),
     "task_comments": (
@@ -3911,95 +3893,11 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    work_intent_id = payload.get("work_intent_id") if payload else None
-    idempotency_key = payload.get("idempotency_key") if payload else None
     conn.execute(
-        "INSERT OR IGNORE INTO task_events "
-        "(task_id, run_id, kind, payload, work_intent_id, idempotency_key, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, pl, work_intent_id, idempotency_key, now),
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, run_id, kind, pl, now),
     )
-
-
-_WORK_INTENT_EVENT_TYPES = frozenset({
-    "task_claimed",
-    "worker_spawn_requested",
-    "worker_spawned",
-    "worker_started",
-    "heartbeat",
-    "worker_exited",
-})
-_WORK_INTENT_POLICY_VERSION = "HEL-3110-v1"
-
-
-def _utc_source_time(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace(
-        "+00:00", "Z"
-    )
-
-
-def _append_work_intent_event(
-    conn: sqlite3.Connection,
-    task_id: str,
-    event_type: str,
-    *,
-    run_id: Optional[int],
-    from_state: str,
-    to_state: str,
-    reason_code: str,
-    source_event_id: str,
-    idempotency_key: str,
-    actor_type: str = "service",
-    actor_id: str = "kanban-dispatcher",
-    causation_event_id: Optional[str] = None,
-    occurred_at: Optional[float] = None,
-) -> None:
-    """Append one minimized, replay-safe dispatcher lifecycle event."""
-    if event_type not in _WORK_INTENT_EVENT_TYPES:
-        raise ValueError(f"unsupported work-intent event type: {event_type}")
-    source_time = occurred_at if occurred_at is not None else time.time()
-    task = conn.execute(
-        "SELECT assignee, session_id FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    payload = {
-        "event_id": f"evt_{secrets.token_hex(16)}",
-        "occurred_at": _utc_source_time(source_time),
-        "recorded_at": _utc_source_time(time.time()),
-        "event_type": event_type,
-        "source_system": "kanban",
-        "source_event_id": source_event_id or "UNKNOWN",
-        "work_intent_id": task_id,
-        "task_id": task_id,
-        "run_id": run_id,
-        "session_id": task["session_id"] if task else None,
-        "linear_issue_id": None,
-        "repo": None,
-        "pr_number": None,
-        "head_sha": None,
-        "deployment_id": None,
-        "environment": None,
-        "deployed_sha": None,
-        "actor_type": actor_type,
-        "actor_id": (
-            task["assignee"]
-            if actor_type == "profile" and task and task["assignee"]
-            else actor_id
-        ),
-        "node_id": _claimer_id().split(":", 1)[0],
-        "from_state": from_state or "UNKNOWN",
-        "to_state": to_state or "UNKNOWN",
-        "reason_code": reason_code,
-        "causation_event_id": causation_event_id,
-        "idempotency_key": idempotency_key,
-        "evidence_ref": f"task:{task_id}/run:{run_id or 'UNKNOWN'}",
-        "policy_version": _WORK_INTENT_POLICY_VERSION,
-        "schema_version": 1,
-    }
-    # Keep legacy ``heartbeat`` rows backward-compatible. The governed typed
-    # event is identified by its envelope's event_type, avoiding a duplicate
-    # legacy heartbeat kind for one source mutation.
-    storage_kind = "work_intent_heartbeat" if event_type == "heartbeat" else event_type
-    _append_event(conn, task_id, storage_kind, payload, run_id=run_id)
 
 
 def _end_run(
@@ -4028,7 +3926,7 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
-    cur = conn.execute(
+    conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -4052,20 +3950,6 @@ def _end_run(
             now,
             run_id,
         ),
-    )
-    if cur.rowcount != 1:
-        return None
-    _append_work_intent_event(
-        conn,
-        task_id,
-        "worker_exited",
-        run_id=run_id,
-        from_state="running",
-        to_state=outcome,
-        reason_code=outcome,
-        source_event_id=f"run:{run_id}:exit:{outcome}",
-        idempotency_key=f"work-intent:{task_id}:run:{run_id}:worker_exited",
-        actor_type="profile",
     )
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
@@ -4396,17 +4280,6 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
-        _append_work_intent_event(
-            conn,
-            task_id,
-            "task_claimed",
-            run_id=run_id,
-            from_state="ready",
-            to_state="running",
-            reason_code="dispatch_claim",
-            source_event_id=f"run:{run_id}:claim",
-            idempotency_key=f"work-intent:{task_id}:run:{run_id}:task_claimed",
-        )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -4489,17 +4362,6 @@ def claim_review_task(
             {"lock": lock, "expires": expires, "run_id": run_id,
              "source_status": "review"},
             run_id=run_id,
-        )
-        _append_work_intent_event(
-            conn,
-            task_id,
-            "task_claimed",
-            run_id=run_id,
-            from_state="review",
-            to_state="running",
-            reason_code="review_dispatch_claim",
-            source_event_id=f"run:{run_id}:claim",
-            idempotency_key=f"work-intent:{task_id}:run:{run_id}:task_claimed",
         )
         return get_task(conn, task_id)
 
@@ -7350,20 +7212,6 @@ def heartbeat_worker(
             {"note": note, "activity_kind": "worker_liveness"},
             run_id=run_id,
         )
-        heartbeat_source_id = f"run:{run_id}:heartbeat:{time.time_ns()}"
-        _append_work_intent_event(
-            conn,
-            task_id,
-            "heartbeat",
-            run_id=run_id,
-            from_state="running",
-            to_state="running",
-            reason_code="worker_liveness",
-            source_event_id=heartbeat_source_id,
-            idempotency_key=f"work-intent:{task_id}:{heartbeat_source_id}",
-            actor_type="profile",
-            occurred_at=float(now),
-        )
     return True
 
 
@@ -8168,30 +8016,6 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
-        source_id = f"run:{run_id}:pid:{int(pid)}"
-        _append_work_intent_event(
-            conn,
-            task_id,
-            "worker_spawned",
-            run_id=run_id,
-            from_state="spawn_requested",
-            to_state="spawned",
-            reason_code="process_created",
-            source_event_id=source_id,
-            idempotency_key=f"work-intent:{task_id}:run:{run_id}:worker_spawned",
-        )
-        _append_work_intent_event(
-            conn,
-            task_id,
-            "worker_started",
-            run_id=run_id,
-            from_state="spawned",
-            to_state="running",
-            reason_code="pid_recorded",
-            source_event_id=source_id,
-            idempotency_key=f"work-intent:{task_id}:run:{run_id}:worker_started",
-            actor_type="profile",
-        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8884,21 +8708,6 @@ def _dispatch_once_locked(
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        with write_txn(conn):
-            run_id = _current_run_id(conn, claimed.id)
-            _append_work_intent_event(
-                conn,
-                claimed.id,
-                "worker_spawn_requested",
-                run_id=run_id,
-                from_state="claimed",
-                to_state="spawn_requested",
-                reason_code="dispatcher_actuation",
-                source_event_id=f"run:{run_id}:spawn_request",
-                idempotency_key=(
-                    f"work-intent:{claimed.id}:run:{run_id}:worker_spawn_requested"
-                ),
-            )
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -9016,21 +8825,6 @@ def _dispatch_once_locked(
         # review agent needs.
         claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        with write_txn(conn):
-            run_id = _current_run_id(conn, claimed.id)
-            _append_work_intent_event(
-                conn,
-                claimed.id,
-                "worker_spawn_requested",
-                run_id=run_id,
-                from_state="claimed",
-                to_state="spawn_requested",
-                reason_code="review_dispatch_actuation",
-                source_event_id=f"run:{run_id}:spawn_request",
-                idempotency_key=(
-                    f"work-intent:{claimed.id}:run:{run_id}:worker_spawn_requested"
-                ),
-            )
         try:
             import inspect
             try:
