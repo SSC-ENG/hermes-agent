@@ -6837,8 +6837,10 @@ class DispatchResult:
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready/review task ids skipped because their assignee is not an
     installed Hermes profile. Each real (non-dry-run) skip also emits a
-    deduplicated ``dispatch_nonspawnable_assignee`` event so the failure is
-    durable and machine-readable instead of silently leaving work queued."""
+    deduplicated ``pre_dispatch_validation_failed`` event
+    (``error_code=missing_assignee_profile``, via ``reject_pre_dispatch``)
+    so the failure is durable and machine-readable instead of silently
+    leaving work queued."""
     pre_dispatch_failed: list[tuple[str, str]] = field(default_factory=list)
     """Task ids rejected by the pre-claim capability gate, paired with the
     stable failure code. A rejected task is blocked before a run is created
