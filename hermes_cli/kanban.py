@@ -943,6 +943,57 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- findings: PPMA finding-to-queue disposition gate ---
+    p_findings = sub.add_parser(
+        "findings",
+        help="Open, disposition, verify, and check TRC/readout findings",
+    )
+    finding_sub = p_findings.add_subparsers(dest="findings_action")
+
+    f_open = finding_sub.add_parser("open", help="Record an accepted finding")
+    f_open.add_argument("finding_key", help="Stable source-scoped finding key")
+    f_open.add_argument("--work-intent", required=True, dest="work_intent_id")
+    f_open.add_argument("--source", required=True, choices=["trc", "readout"])
+    f_open.add_argument("--source-ref", required=True)
+    f_open.add_argument("--title", required=True)
+    f_open.add_argument("--owner", required=True, dest="owner_id")
+    f_open.add_argument("--actor", required=True, dest="actor_id")
+    f_open.add_argument("--json", action="store_true")
+
+    f_disposition = finding_sub.add_parser(
+        "disposition", help="Record the finding's one immutable disposition"
+    )
+    f_disposition.add_argument("finding_key")
+    f_disposition.add_argument(
+        "disposition", choices=sorted(kb.FINDING_DISPOSITIONS)
+    )
+    f_disposition.add_argument("--linear-issue", dest="linear_issue_id")
+    f_disposition.add_argument("--decision-record", dest="decision_record_ref")
+    f_disposition.add_argument("--actor", required=True, dest="actor_id")
+    f_disposition.add_argument("--json", action="store_true")
+
+    f_verify = finding_sub.add_parser(
+        "verify", help="Verify queue or decision evidence and close the gate"
+    )
+    f_verify.add_argument("finding_key")
+    f_verify.add_argument("--actor", required=True, dest="actor_id")
+    f_verify.add_argument("--json", action="store_true")
+
+    f_decision = finding_sub.add_parser(
+        "decision", help="Durably record a rejected/deferred/not-applicable decision"
+    )
+    f_decision.add_argument("decision_ref", help="Durable decision reference")
+    f_decision.add_argument("--actor", required=True, dest="actor_id")
+    f_decision.add_argument("--rationale", required=True)
+    f_decision.add_argument("--json", action="store_true")
+
+    f_list = finding_sub.add_parser("list", aliases=["ls"], help="List findings")
+    f_list.add_argument("--json", action="store_true")
+    f_check = finding_sub.add_parser(
+        "check", help="Fail when any accepted finding remains orphaned"
+    )
+    f_check.add_argument("--json", action="store_true")
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -1106,6 +1157,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
+            "findings":   _cmd_findings,
             "gc":       _cmd_gc,
         }
         handler = handlers.get(action)
@@ -1164,6 +1216,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "notify-unsubscribe",
     "specify",
     "decompose",
+    "findings",
     "gc",
 })
 
@@ -3116,6 +3169,162 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     if not all_flag:
         return 0 if ok_count == 1 else 1
     return 0 if (ok_count > 0 or not ids) else 1
+
+
+def _finding_to_dict(finding: kb.Finding) -> dict[str, Any]:
+    return {
+        "finding_key": finding.finding_key,
+        "work_intent_id": finding.work_intent_id,
+        "source_system": finding.source_system,
+        "source_ref": finding.source_ref,
+        "title": finding.title,
+        "owner_id": finding.owner_id,
+        "disposition": finding.disposition,
+        "linear_issue_id": finding.linear_issue_id,
+        "decision_record_ref": finding.decision_record_ref,
+        "opened_at": finding.opened_at,
+        "dispositioned_at": finding.dispositioned_at,
+        "verified_at": finding.verified_at,
+        "verification_evidence_ref": finding.verification_evidence_ref,
+        "verification_source": finding.verification_source,
+        "verification_observed_state": finding.verification_observed_state,
+    }
+
+
+def _cmd_findings(args: argparse.Namespace) -> int:
+    """Execute the PPMA finding-to-queue lifecycle and orphan gate."""
+    action = getattr(args, "findings_action", None)
+    if not action:
+        print("kanban findings: choose open, disposition, verify, decision, list, or check",
+              file=sys.stderr)
+        return 2
+
+    with kb.connect_closing() as conn:
+        if action == "open":
+            finding = kb.open_finding(
+                conn,
+                finding_key=args.finding_key,
+                work_intent_id=args.work_intent_id,
+                source_system=args.source,
+                source_ref=args.source_ref,
+                title=args.title,
+                owner_id=args.owner_id,
+                actor_id=args.actor_id,
+            )
+            payload = _finding_to_dict(finding)
+            if args.json:
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+            else:
+                print(f"Opened finding {finding.finding_key} for {finding.work_intent_id}")
+            return 0
+
+        if action == "disposition":
+            finding = kb.disposition_finding(
+                conn,
+                finding_key=args.finding_key,
+                disposition=args.disposition,
+                linear_issue_id=args.linear_issue_id,
+                decision_record_ref=args.decision_record_ref,
+                actor_id=args.actor_id,
+            )
+            payload = _finding_to_dict(finding)
+            if args.json:
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+            else:
+                target = finding.linear_issue_id or finding.decision_record_ref
+                print(
+                    f"Dispositioned {finding.finding_key}: "
+                    f"{finding.disposition} -> {target}"
+                )
+            return 0
+
+        if action == "verify":
+            # The CLI path goes through the same governed adapters as the
+            # Python API: the disposition on the finding decides which
+            # adapter runs, and the typed VerifiedEvidence it returns is
+            # the only accepted proof. No free-form evidence flags exist.
+            existing = kb.get_finding(conn, args.finding_key)
+            if existing is None:
+                print(f"kanban findings: unknown finding_key {args.finding_key!r}",
+                      file=sys.stderr)
+                return 2
+            if existing.disposition in kb.ACCEPTED_FINDING_DISPOSITIONS:
+                evidence = kb.fetch_linear_issue_evidence(
+                    existing.linear_issue_id or ""
+                )
+            elif existing.disposition is not None:
+                evidence = kb.fetch_decision_record_evidence(
+                    conn, existing.decision_record_ref or ""
+                )
+            else:
+                print(f"kanban findings: {args.finding_key!r} has no disposition",
+                      file=sys.stderr)
+                return 2
+            finding = kb.verify_finding(
+                conn,
+                args.finding_key,
+                actor_id=args.actor_id,
+                evidence=evidence,
+            )
+            payload = _finding_to_dict(finding)
+            if args.json:
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+            else:
+                print(f"Verified finding {finding.finding_key}")
+            return 0
+
+        if action == "decision":
+            ref = kb.record_finding_decision(
+                conn,
+                decision_ref=args.decision_ref,
+                actor_id=args.actor_id,
+                rationale=args.rationale,
+            )
+            if args.json:
+                print(json.dumps({"decision_ref": ref}, ensure_ascii=False))
+            else:
+                print(f"Recorded decision {ref}")
+            return 0
+
+        if action in {"list", "ls"}:
+            findings = kb.list_findings(conn)
+            if args.json:
+                print(json.dumps(
+                    [_finding_to_dict(finding) for finding in findings],
+                    indent=2,
+                    ensure_ascii=False,
+                ))
+            elif not findings:
+                print("(no findings)")
+            else:
+                for finding in findings:
+                    state = "verified" if finding.verified_at else (
+                        finding.disposition or "ORPHAN"
+                    )
+                    print(
+                        f"{finding.finding_key}  {state:18s}  "
+                        f"{finding.owner_id:20s}  {finding.title}"
+                    )
+            return 0
+
+        if action == "check":
+            orphans = kb.list_orphan_findings(conn)
+            payload = {
+                "ok": not orphans,
+                "orphan_count": len(orphans),
+                "orphans": [_finding_to_dict(finding) for finding in orphans],
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+            elif orphans:
+                print(f"ORPHAN FINDINGS: {len(orphans)}", file=sys.stderr)
+                for finding in orphans:
+                    print(f"  {finding.finding_key}: {finding.title}", file=sys.stderr)
+            else:
+                print("Finding-to-queue gate: PASS (0 orphans)")
+            return 0 if not orphans else 1
+
+    return 2
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
