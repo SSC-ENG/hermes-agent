@@ -8216,55 +8216,6 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    def record_nonspawnable(task_id: str, assignee: str, task_status: str) -> None:
-        """Persist one actionable event for a missing-profile assignment.
-
-        Dispatcher ticks are frequent, so identical unresolved failures are
-        deduplicated. Reassignment (or a later transition back into the same
-        bad assignment) changes the task's event stream and permits a fresh
-        signal without producing one event per tick.
-        """
-        if dry_run:
-            return
-        error = (
-            f"Assignee profile {assignee!r} does not exist; create that Hermes "
-            "profile or reassign the task to an installed profile."
-        )
-        # Ignore unrelated comments/diagnostic events when deduplicating, but
-        # let an explicit reassignment reset the signal so assigning back to
-        # the same missing name is reported again.
-        latest = conn.execute(
-            "SELECT kind, payload FROM task_events WHERE task_id = ? "
-            "AND kind IN ('dispatch_nonspawnable_assignee', 'assigned') "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if latest is not None and latest["kind"] == "dispatch_nonspawnable_assignee":
-            try:
-                prior = json.loads(latest["payload"] or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                prior = {}
-            if (
-                prior.get("assignee") == assignee
-                and prior.get("task_status") == task_status
-                and prior.get("error_code") == "missing_assignee_profile"
-            ):
-                return
-        with write_txn(conn):
-            _append_event(
-                conn,
-                task_id,
-                "dispatch_nonspawnable_assignee",
-                {
-                    "outcome": "dispatch_failed",
-                    "error_code": "missing_assignee_profile",
-                    "error": error,
-                    "assignee": assignee,
-                    "task_status": task_status,
-                    "action": "create_profile_or_reassign",
-                },
-            )
-
     def reject_pre_dispatch(task: Task, failure: Any) -> None:
         """Block one invalid candidate before claim and emit one durable event."""
         result.pre_dispatch_failed.append((task.id, failure.code))

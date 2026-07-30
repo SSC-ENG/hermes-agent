@@ -185,6 +185,34 @@ def test_wrong_node_fails_before_claim(kanban_home, monkeypatch):
     assert failure.payload["action"] == "route_to_eligible_node"
 
 
+def test_legacy_profile_without_soul_remains_dispatchable(kanban_home, monkeypatch):
+    profile = kanban_home / "profiles" / "legacy"
+    profile.mkdir(parents=True)
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db._resolve_hermes_argv",
+        lambda: ["python3", "-m", "hermes_cli.main"],
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="legacy profile preflight",
+            assignee="legacy",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+        )
+        spawned = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert result.pre_dispatch_failed == []
+    assert spawned == [task_id]
+    assert task.status == "running"
+
+
 def test_valid_candidate_is_claimed_and_spawned(kanban_home, monkeypatch):
     profile = _profile(kanban_home)
     _skill(profile, "ready-skill")
