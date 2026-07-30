@@ -56,7 +56,13 @@ def test_accepted_finding_requires_one_issue_and_zero_orphans_after_verification
         )
         assert [row.finding_key for row in kb.list_orphan_findings(conn)] == [finding.finding_key]
 
-        kb.verify_finding(conn, finding.finding_key, actor_id="paul-park")
+        kb.verify_finding(
+            conn,
+            finding.finding_key,
+            actor_id="paul-park",
+            verification_evidence_ref="linear:HEL-3112:9a48515e-6535-4393-81e4-6fd6c7dc6023",
+            verification_source="linear_graphql",
+        )
         assert kb.list_orphan_findings(conn) == []
         events = _finding_events(conn, board)
 
@@ -141,7 +147,13 @@ def test_nonaccepted_dispositions_require_explicit_decision_record(board, dispos
             decision_record_ref=f"decision:{disposition}",
             actor_id="paul-park",
         )
-        kb.verify_finding(conn, key, actor_id="paul-park")
+        kb.verify_finding(
+            conn,
+            key,
+            actor_id="paul-park",
+            verification_evidence_ref=f"decision:{disposition}",
+            verification_source="decision_record",
+        )
         assert kb.list_orphan_findings(conn) == []
 
 
@@ -260,6 +272,125 @@ def test_cli_check_is_machine_readable_and_fail_closed(board):
         "findings disposition trc:cli-gap accepted_queued "
         "--linear-issue HEL-3112 --actor paul-park"
     )
-    kc.run_slash("findings verify trc:cli-gap --actor paul-park")
+    kc.run_slash(
+        "findings verify trc:cli-gap --actor paul-park "
+        "--evidence-ref linear:HEL-3112:9a48515e-6535-4393-81e4-6fd6c7dc6023 "
+        "--verification-source linear_graphql"
+    )
     checked = json.loads(kc.run_slash("findings check --json"))
     assert checked == {"ok": True, "orphan_count": 0, "orphans": []}
+
+
+def test_telemetry_review_finding_is_promoted_into_orphan_gate(board):
+    with kb.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO telemetry_review_findings (
+                finding_key, rule_id, board_slug, subject_json,
+                first_observed_at, last_observed_at, severity,
+                evidence_state, state, report_json
+            ) VALUES (?, ?, ?, ?, 1, 1, 'HIGH', 'MEASURED', 'NEW', ?)
+            """,
+            (
+                "telemetry:missing-queue",
+                "INTAKE.NOT_QUEUED",
+                "default",
+                json.dumps({"task_ids": [board]}),
+                json.dumps({"title": "Telemetry finding", "owner": "paul-park"}),
+            ),
+        )
+        conn.commit()
+        orphans = kb.list_orphan_findings(conn)
+
+    assert [row.finding_key for row in orphans] == ["telemetry:missing-queue"]
+
+
+def test_verify_rejects_malformed_external_evidence(board):
+    with kb.connect() as conn:
+        finding = kb.open_finding(
+            conn,
+            finding_key="trc:bad-linear",
+            work_intent_id=board,
+            source_system="trc",
+            source_ref="TRC#bad-linear",
+            title="Bad Linear reference",
+            owner_id="paul-park",
+            actor_id="tessa-cole",
+        )
+        kb.disposition_finding(
+            conn,
+            finding_key=finding.finding_key,
+            disposition="accepted_queued",
+            linear_issue_id="not-a-linear-id",
+            actor_id="paul-park",
+        )
+        with pytest.raises(ValueError, match="Linear issue"):
+            kb.verify_finding(
+                conn,
+                finding.finding_key,
+                actor_id="paul-park",
+                verification_evidence_ref="linear:not-a-linear-id:fake",
+                verification_source="linear_graphql",
+            )
+
+
+def test_direct_sql_cannot_change_existing_disposition(board):
+    with kb.connect() as conn:
+        kb.open_finding(
+            conn,
+            finding_key="trc:immutable",
+            work_intent_id=board,
+            source_system="trc",
+            source_ref="TRC#immutable",
+            title="Immutable disposition",
+            owner_id="paul-park",
+            actor_id="tessa-cole",
+        )
+        kb.disposition_finding(
+            conn,
+            finding_key="trc:immutable",
+            disposition="accepted_existing",
+            linear_issue_id="HEL-3112",
+            actor_id="paul-park",
+        )
+        with pytest.raises(Exception, match="disposition is immutable"):
+            conn.execute(
+                "UPDATE findings SET disposition = 'deferred', "
+                "linear_issue_id = NULL, decision_record_ref = 'decision:x' "
+                "WHERE finding_key = 'trc:immutable'"
+            )
+
+
+def test_archived_task_with_finding_can_be_purged(board):
+    with kb.connect() as conn:
+        kb.open_finding(
+            conn,
+            finding_key="trc:purge",
+            work_intent_id=board,
+            source_system="trc",
+            source_ref="TRC#purge",
+            title="Purge-safe finding",
+            owner_id="paul-park",
+            actor_id="tessa-cole",
+        )
+        assert kb.archive_task(conn, board)
+        assert kb.delete_archived_task(conn, board)
+        assert kb.get_task(conn, board) is None
+        assert kb.get_finding(conn, "trc:purge") is None
+
+
+def test_hard_delete_task_with_finding_cleans_ledger(board):
+    with kb.connect() as conn:
+        kb.open_finding(
+            conn,
+            finding_key="trc:hard-delete",
+            work_intent_id=board,
+            source_system="trc",
+            source_ref="TRC#hard-delete",
+            title="Hard-delete-safe finding",
+            owner_id="paul-park",
+            actor_id="tessa-cole",
+        )
+        assert kb.delete_task(conn, board)
+        assert kb.get_task(conn, board) is None
+        assert kb.get_finding(conn, "trc:hard-delete") is None

@@ -977,6 +977,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     f_verify.add_argument("finding_key")
     f_verify.add_argument("--actor", required=True, dest="actor_id")
+    f_verify.add_argument("--evidence-ref", required=True, dest="verification_evidence_ref")
+    f_verify.add_argument("--verification-source", required=True)
     f_verify.add_argument("--json", action="store_true")
 
     f_list = finding_sub.add_parser("list", aliases=["ls"], help="List findings")
@@ -3177,6 +3179,8 @@ def _finding_to_dict(finding: kb.Finding) -> dict[str, Any]:
         "opened_at": finding.opened_at,
         "dispositioned_at": finding.dispositioned_at,
         "verified_at": finding.verified_at,
+        "verification_evidence_ref": finding.verification_evidence_ref,
+        "verification_source": finding.verification_source,
     }
 
 
@@ -3229,7 +3233,11 @@ def _cmd_findings(args: argparse.Namespace) -> int:
 
         if action == "verify":
             finding = kb.verify_finding(
-                conn, args.finding_key, actor_id=args.actor_id
+                conn,
+                args.finding_key,
+                actor_id=args.actor_id,
+                verification_evidence_ref=args.verification_evidence_ref,
+                verification_source=args.verification_source,
             )
             payload = _finding_to_dict(finding)
             if args.json:

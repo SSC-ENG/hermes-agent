@@ -1162,6 +1162,8 @@ class Finding:
     opened_at: int
     dispositioned_at: Optional[int]
     verified_at: Optional[int]
+    verification_evidence_ref: Optional[str]
+    verification_source: Optional[str]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Finding":
@@ -1333,6 +1335,8 @@ CREATE TABLE IF NOT EXISTS findings (
     opened_at           INTEGER NOT NULL,
     dispositioned_at    INTEGER,
     verified_at         INTEGER,
+    verification_evidence_ref TEXT,
+    verification_source TEXT,
     CHECK (
         disposition IS NULL
         OR (
@@ -1347,6 +1351,36 @@ CREATE TABLE IF NOT EXISTS findings (
         )
     )
 );
+
+CREATE TRIGGER IF NOT EXISTS trg_telemetry_finding_to_ledger
+AFTER INSERT ON telemetry_review_findings
+WHEN json_extract(NEW.subject_json, '$.task_ids[0]') IS NOT NULL
+ AND EXISTS (
+     SELECT 1 FROM tasks
+      WHERE id = json_extract(NEW.subject_json, '$.task_ids[0]')
+ )
+BEGIN
+    INSERT OR IGNORE INTO findings (
+        finding_key, work_intent_id, source_system, source_ref,
+        title, owner_id, opened_at
+    ) VALUES (
+        NEW.finding_key,
+        json_extract(NEW.subject_json, '$.task_ids[0]'),
+        'trc',
+        'telemetry:' || NEW.finding_key,
+        COALESCE(json_extract(NEW.report_json, '$.title'), NEW.rule_id),
+        COALESCE(json_extract(NEW.report_json, '$.owner'), 'OWNER.UNRESOLVED'),
+        NEW.first_observed_at
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_finding_disposition_immutable
+BEFORE UPDATE OF disposition ON findings
+WHEN OLD.disposition IS NOT NULL
+ AND NEW.disposition IS NOT OLD.disposition
+BEGIN
+    SELECT RAISE(ABORT, 'disposition is immutable');
+END;
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
@@ -2520,6 +2554,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_attachments_content "
             "ON task_attachments(task_id, content_sha256)"
         )
+
+    finding_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'findings'"
+    ).fetchone()
+    if finding_table_exists:
+        finding_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(findings)")
+        }
+        if "verification_evidence_ref" not in finding_cols:
+            _add_column_if_missing(
+                conn, "findings", "verification_evidence_ref",
+                "verification_evidence_ref TEXT",
+            )
+        if "verification_source" not in finding_cols:
+            _add_column_if_missing(
+                conn, "findings", "verification_source", "verification_source TEXT"
+            )
 
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
@@ -4259,7 +4310,43 @@ def list_orphan_findings(conn: sqlite3.Connection) -> list[Finding]:
          ORDER BY opened_at ASC, finding_key ASC
         """
     ).fetchall()
-    return [Finding.from_row(row) for row in rows]
+    findings = [Finding.from_row(row) for row in rows]
+    known = {finding.finding_key for finding in findings}
+    telemetry_rows = conn.execute(
+        """
+        SELECT finding_key, subject_json, rule_id, report_json, first_observed_at
+          FROM telemetry_review_findings
+         WHERE finding_key NOT IN (SELECT finding_key FROM findings)
+         ORDER BY first_observed_at ASC, finding_key ASC
+        """
+    ).fetchall()
+    for row in telemetry_rows:
+        if row["finding_key"] in known:
+            continue
+        try:
+            subject = json.loads(row["subject_json"])
+            report = json.loads(row["report_json"])
+        except (TypeError, ValueError):
+            subject, report = {}, {}
+        task_ids = subject.get("task_ids") if isinstance(subject, dict) else []
+        task_id = task_ids[0] if isinstance(task_ids, list) and task_ids else "UNKNOWN"
+        findings.append(Finding(
+            finding_key=row["finding_key"],
+            work_intent_id=str(task_id),
+            source_system="trc",
+            source_ref=f"telemetry:{row['finding_key']}",
+            title=str(report.get("title") or row["rule_id"]),
+            owner_id=str(report.get("owner") or "OWNER.UNRESOLVED"),
+            disposition=None,
+            linear_issue_id=None,
+            decision_record_ref=None,
+            opened_at=int(row["first_observed_at"]),
+            dispositioned_at=None,
+            verified_at=None,
+            verification_evidence_ref=None,
+            verification_source=None,
+        ))
+    return findings
 
 
 def _append_finding_event(
@@ -4472,12 +4559,20 @@ def verify_finding(
     finding_key: str,
     *,
     actor_id: str,
+    verification_evidence_ref: str,
+    verification_source: str,
 ) -> Finding:
-    """Close the gate after PPMA verifies the queue or decision evidence."""
+    """Close the gate with a durable verifier attestation for the evidence."""
     key = (finding_key or "").strip()
     actor = (actor_id or "").strip()
+    evidence_ref = _validate_finding_ref(
+        verification_evidence_ref, field_name="verification evidence reference"
+    )
+    source = (verification_source or "").strip()
     if not actor:
         raise ValueError("actor_id is required")
+    if not source:
+        raise ValueError("verification_source is required")
     with write_txn(conn):
         existing = get_finding(conn, key)
         if existing is None:
@@ -4485,10 +4580,32 @@ def verify_finding(
         if existing.disposition is None:
             raise ValueError(f"finding {key!r} has no disposition")
         if existing.verified_at is not None:
-            return existing
+            if (
+                existing.verification_evidence_ref == evidence_ref
+                and existing.verification_source == source
+            ):
+                return existing
+            raise ValueError(f"finding {key!r} already has different verification evidence")
+        if existing.disposition in ACCEPTED_FINDING_DISPOSITIONS:
+            if not existing.linear_issue_id or not re.fullmatch(
+                r"[A-Z][A-Z0-9]*-[1-9][0-9]*", existing.linear_issue_id
+            ):
+                raise ValueError(
+                    f"finding {key!r} has an invalid Linear issue reference"
+                )
+            expected_prefix = f"linear:{existing.linear_issue_id}:"
+            if not evidence_ref.startswith(expected_prefix):
+                raise ValueError(
+                    f"verification evidence must attest Linear issue {existing.linear_issue_id}"
+                )
+        elif evidence_ref != existing.decision_record_ref:
+            raise ValueError(
+                "verification evidence must match the disposition decision record"
+            )
         conn.execute(
-            "UPDATE findings SET verified_at = ? WHERE finding_key = ?",
-            (int(time.time()), key),
+            "UPDATE findings SET verified_at = ?, verification_evidence_ref = ?, "
+            "verification_source = ? WHERE finding_key = ?",
+            (int(time.time()), evidence_ref, source, key),
         )
         finding = get_finding(conn, key)
         assert finding is not None
@@ -7119,6 +7236,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM findings WHERE work_intent_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -7144,14 +7262,16 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if scope is None:
             return False
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        exists = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if exists is None:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM findings WHERE work_intent_id = ?", (task_id,))
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
