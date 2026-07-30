@@ -216,3 +216,25 @@ def test_retry_thrash_flags_two_failures_and_escalates_on_breaker(board):
     hole_after = next(h for h in with_breaker["holes"] if h["rule_id"] == "FAILURE.RETRY_THRASH")
     assert hole_before["severity"] == "HIGH"
     assert hole_after["severity"] == "CRITICAL"
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "expected_severity"),
+    [
+        (telemetry.BLOCKED_AGED_MEDIUM_SECONDS, "MEDIUM"),
+        (telemetry.BLOCKED_AGED_HIGH_SECONDS, "HIGH"),
+        (telemetry.BLOCKED_AGED_CRITICAL_SECONDS, "CRITICAL"),
+    ],
+)
+def test_blocked_aged_severity_ladder(board, age_seconds, expected_severity):
+    end = 1_800_000_000
+    blocked_at = end - age_seconds
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="blocked", assignee="felix-steele", initial_status="blocked")
+        conn.execute(
+            "UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?", (task,),
+        )
+        _insert_event(conn, task, "blocked", {"reason": "needs decision", "kind": "needs_input", "recurrences": 1}, blocked_at)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.BLOCKED_AGED")
+    assert hole["severity"] == expected_severity
