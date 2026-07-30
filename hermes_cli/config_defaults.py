@@ -538,10 +538,14 @@ DEFAULT_CONFIG = {
                                       # floored at 0.75 (raise-only) so compaction
                                       # doesn't fire with half the window still free;
                                       # set this above 0.75 to override the floor.
-        "threshold_tokens": None,     # absolute token cap — when set, compression
-                                      # triggers at the lower of the ratio-based
-                                      # threshold and this token count. Clamped to
-                                      # the model's context length at apply-time.
+        "threshold_tokens": 100_000,  # absolute token cap (first-fires-wins vs ratio).
+                                      # Required on large-window models (e.g. 1M
+                                      # Claude): ratio-only 50% never fires until
+                                      # 500K tokens, but real long sessions peak
+                                      # ~100–200K and pay 2× input permanently.
+                                      # Set null/0 to disable the absolute cap and
+                                      # use ratio-only. Clamped to the model's
+                                      # context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to

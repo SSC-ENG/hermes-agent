@@ -1807,13 +1807,19 @@ class TestThresholdTokensCap:
         assert comp.should_compress(200_000) is True    # at cap (below 500K pct)
         assert comp.should_compress(250_000) is True    # above cap
 
-    def test_default_config_disabled_and_no_behavior_change(self):
-        """DEFAULT_CONFIG ships threshold_tokens=None (disabled) and both
-        None and 0 leave the ratio-based trigger byte-identical."""
+    def test_default_config_ships_absolute_cap_and_null_or_zero_opts_out(self):
+        """DEFAULT_CONFIG ships a sane absolute cap so large-window models
+        actually compact (ratio-only 50% of 1M = 500K never fires for real
+        agent sessions). Explicit None/0 on the compressor leaves ratio-only
+        behavior for opt-out and unit baselines."""
         from hermes_cli.config import DEFAULT_CONFIG
-        assert DEFAULT_CONFIG["compression"]["threshold_tokens"] is None
+        assert DEFAULT_CONFIG["compression"]["threshold_tokens"] == 100_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+            # Bare compressor without a wire-up cap still ratio-only — the
+            # DEFAULT_CONFIG value is applied by agent_init, not __init__.
+            # Context length is resolved lazily, so all property accesses must
+            # stay inside the patch window.
             baseline = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
             )
@@ -1825,14 +1831,24 @@ class TestThresholdTokensCap:
                 "model-a", threshold_percent=0.50, quiet_mode=True,
                 threshold_tokens_cap=0,
             )
-        assert comp_none.threshold_tokens == baseline.threshold_tokens
-        assert comp_zero.threshold_tokens == baseline.threshold_tokens
-        # And after a model switch, still identical to baseline.
-        baseline.update_model("model-b", context_length=200_000)
-        comp_none.update_model("model-b", context_length=200_000)
-        comp_zero.update_model("model-b", context_length=200_000)
-        assert comp_none.threshold_tokens == baseline.threshold_tokens
-        assert comp_zero.threshold_tokens == baseline.threshold_tokens
+            comp_default = ContextCompressor(
+                "model-a", threshold_percent=0.50, quiet_mode=True,
+                threshold_tokens_cap=DEFAULT_CONFIG["compression"]["threshold_tokens"],
+            )
+            assert baseline.threshold_tokens == 500_000
+            assert comp_none.threshold_tokens == baseline.threshold_tokens
+            assert comp_zero.threshold_tokens == baseline.threshold_tokens
+            assert comp_default.threshold_tokens == 100_000
+            # Default-capped compressor fires at the absolute ramp, not 500K.
+            assert comp_default.should_compress(99_999) is False
+            assert comp_default.should_compress(100_000) is True
+            assert comp_default.should_compress(150_000) is True
+            # And after a model switch, opt-out paths stay identical to baseline.
+            baseline.update_model("model-b", context_length=200_000)
+            comp_none.update_model("model-b", context_length=200_000)
+            comp_zero.update_model("model-b", context_length=200_000)
+            assert comp_none.threshold_tokens == baseline.threshold_tokens
+            assert comp_zero.threshold_tokens == baseline.threshold_tokens
 
 
 
