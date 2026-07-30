@@ -63,7 +63,15 @@ def _utc(epoch: int) -> str:
 
 def _implementation_sha() -> str:
     try:
-        result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5, check=False)
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
         return result.stdout.strip() or "UNKNOWN"
     except Exception:
         return "UNKNOWN"
