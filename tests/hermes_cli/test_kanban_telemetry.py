@@ -238,3 +238,60 @@ def test_blocked_aged_severity_ladder(board, age_seconds, expected_severity):
         report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
     hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.BLOCKED_AGED")
     assert hole["severity"] == expected_severity
+
+
+def test_todo_promotable_flags_stuck_task_after_two_ticks(board):
+    end = 1_800_000_000
+    eligible_since = end - telemetry.TODO_PROMOTABLE_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="felix-steele")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="felix-steele")
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            (eligible_since, parent),
+        )
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.TODO_PROMOTABLE")
+    assert hole["severity"] == "HIGH"
+    assert child in hole["subject"]["task_ids"]
+
+
+def test_todo_promotable_suppressed_after_promotion(board):
+    end = 1_800_000_000
+    eligible_since = end - telemetry.TODO_PROMOTABLE_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="felix-steele")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="felix-steele")
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = ? WHERE id IN (?, ?)",
+            (eligible_since, parent, child),
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        _insert_event(conn, child, "promoted", {"from_status": "todo", "to_status": "ready"}, eligible_since + 5)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    rule_ids = {h["rule_id"] for h in report["holes"]}
+    assert "STALL.TODO_PROMOTABLE" not in rule_ids
+
+
+def test_ready_unclaimed_flags_task_after_two_ticks(board):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="unclaimed", assignee="felix-steele")
+        _insert_event(conn, task, "created", {}, ready_since)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.READY_UNCLAIMED")
+    assert hole["severity"] == "HIGH"
+    assert task in hole["subject"]["task_ids"]
+
+
+def test_ready_unclaimed_suppressed_after_claim(board):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="claimed", assignee="felix-steele")
+        _insert_event(conn, task, "created", {}, ready_since)
+        _insert_event(conn, task, "claimed", {"lock": "host:1"}, ready_since + 5)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    rule_ids = {h["rule_id"] for h in report["holes"]}
+    assert "STALL.READY_UNCLAIMED" not in rule_ids
