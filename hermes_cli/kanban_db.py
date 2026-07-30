@@ -3608,6 +3608,82 @@ def add_comment(
         return int(cur.lastrowid or 0)
 
 
+_LINEAR_SCOPE_RE = re.compile(
+    r"LINEAR_SCOPE:\s*parent=(?P<parent>[A-Z][A-Z0-9]+-\d+)\s+"
+    r"subissues=\[(?P<subissues>.+)\]",
+    re.DOTALL,
+)
+_LINEAR_SUBISSUE_RE = re.compile(
+    r"(?:key\s*[:=]\s*)?(?P<key>[A-Z][A-Z0-9]+-\d+)\s*"
+    r"[,;]\s*cptc\s*[:=]\s*(?P<cptc>1|2|3|5|8|13)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_linear_scope(body: str) -> Optional[dict]:
+    """Parse PPMA's structured Linear/CPTC handoff, or return ``None``."""
+    match = _LINEAR_SCOPE_RE.search(body or "")
+    if not match:
+        return None
+    subissues = [
+        {"key": item.group("key").upper(), "cptc": int(item.group("cptc"))}
+        for item in _LINEAR_SUBISSUE_RE.finditer(match.group("subissues"))
+    ]
+    if not subissues:
+        return None
+    return {"parent": match.group("parent").upper(), "subissues": subissues}
+
+
+def record_scope_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: str,
+    body: str,
+) -> dict:
+    """Persist a validated PPMA scope comment and typed handoff events."""
+    scope = parse_linear_scope(body)
+    if scope is None:
+        raise ValueError(
+            "PPMA scope handoff must contain LINEAR_SCOPE with at least one "
+            "{key, cptc} technical sub-issue"
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise ValueError(f"unknown task {task_id}")
+        if task["assignee"] != "paul-park":
+            raise ValueError("scope handoff is only valid for a PPMA gate task")
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'scope_recorded'",
+            (task_id,),
+        ).fetchone()
+        if existing:
+            return scope
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, author.strip(), body.strip(), now),
+        )
+        payload = {"schema_version": 1, **scope, "recorded_by": author.strip()}
+        _append_event(conn, task_id, "scope_recorded", payload)
+        _append_event(
+            conn,
+            task_id,
+            "handoff_emitted",
+            {
+                "schema_version": 1,
+                "handoff_kind": "linear_scope",
+                "downstream_task_ids": child_ids(conn, task_id),
+                "scope_parent": scope["parent"],
+            },
+        )
+    return scope
+
+
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
@@ -6453,6 +6529,60 @@ def decompose_triage_task(
     if auto_promote:
         recompute_ready(conn)
     return child_ids
+
+
+def create_governed_intake_task(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    body: str,
+    tenant: str,
+    idempotency_key: str,
+    created_by: Optional[str] = None,
+    priority: int = 0,
+) -> tuple[str, bool]:
+    """Atomically deduplicate and create one governed raw-intake task.
+
+    ``create_task`` intentionally has legacy best-effort idempotency semantics.
+    Governed intake needs a stronger contract because duplicate webhook/feed
+    deliveries may race. Serialize the lookup+insert under one write transaction
+    without changing the compatibility behavior of the general task API.
+    """
+    if not idempotency_key or not idempotency_key.strip():
+        raise ValueError("governed intake requires an idempotency_key")
+    now = int(time.time())
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key.strip(),),
+        ).fetchone()
+        if existing:
+            return existing["id"], False
+        task_id = _new_task_id()
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, body, status, workspace_kind, tenant, priority, "
+            " created_at, created_by, idempotency_key) "
+            "VALUES (?, ?, ?, 'triage', 'scratch', ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                title.strip(),
+                body,
+                tenant.strip(),
+                int(priority),
+                now,
+                created_by,
+                idempotency_key.strip(),
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "created",
+            {"by": created_by, "assignee": None, "status": "triage", "parents": []},
+        )
+        return task_id, True
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
