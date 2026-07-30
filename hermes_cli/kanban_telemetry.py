@@ -537,6 +537,63 @@ def run_review(
             observed_at=blocked_since,
         ))
 
+    for task_id, task in tasks.items():
+        if task["status"] != "todo":
+            continue
+        parent_rows = conn.execute(
+            "SELECT t.status, t.completed_at FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id WHERE l.child_id = ?",
+            (task_id,),
+        ).fetchall()
+        if not parent_rows or not all(p["status"] in ("done", "archived") for p in parent_rows):
+            continue
+        completions = [p["completed_at"] for p in parent_rows if p["completed_at"]]
+        eligible_since = max(completions) if completions else task["created_at"]
+        age = end - eligible_since
+        if age < TODO_PROMOTABLE_THRESHOLD_SECONDS:
+            continue
+        promoted_after = any(
+            e["kind"] == "promoted" and e["created_at"] > eligible_since
+            for e in by_task.get(task_id, [])
+        )
+        if promoted_after:
+            continue
+        holes.append(_finding(
+            "STALL.TODO_PROMOTABLE", board_slug,
+            _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity="HIGH",
+            evidence_state="MEASURED", title="All parents terminal but task was not promoted to ready",
+            owner="OWNER.UNRESOLVED",
+            recommendation="Repair recompute_ready so parent-terminal todo tasks promote within two dispatcher ticks.",
+            evidence=[{"event_ids": [], "query_id": "Q-STALL-02", "fact": f"All parents terminal since {_utc(eligible_since)}; no promoted event followed within {TODO_PROMOTABLE_THRESHOLD_SECONDS}s."}],
+            observed_at=eligible_since, next_expected_event="promoted",
+        ))
+
+    _ready_predecessor_kinds = {"promoted", "created", "reclaimed", "crashed", "rate_limited", "timed_out", "spawn_failed"}
+    for task_id, task in tasks.items():
+        if task["status"] != "ready":
+            continue
+        task_events = by_task.get(task_id, [])
+        ready_candidates = [e["created_at"] for e in task_events if e["kind"] in _ready_predecessor_kinds]
+        ready_since = max(ready_candidates) if ready_candidates else task["created_at"]
+        age = end - ready_since
+        if age < READY_UNCLAIMED_THRESHOLD_SECONDS:
+            continue
+        claimed_after = any(
+            e["kind"] == "claimed" and e["created_at"] > ready_since
+            for e in task_events
+        )
+        if claimed_after:
+            continue
+        holes.append(_finding(
+            "STALL.READY_UNCLAIMED", board_slug,
+            _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity="HIGH",
+            evidence_state="MEASURED", title="Ready task was not claimed within two dispatcher ticks",
+            owner="OWNER.UNRESOLVED",
+            recommendation="Verify dispatcher health and profile spawnability for this assignee; this measurement does not yet apply full idle-agent capacity safeguards.",
+            evidence=[{"event_ids": [], "query_id": "Q-STALL-03", "fact": f"Ready since {_utc(ready_since)}; no claimed event followed within {READY_UNCLAIMED_THRESHOLD_SECONDS}s."}],
+            observed_at=ready_since, next_expected_event="claimed",
+        ))
+
     holes = _apply_prior_states(conn, holes, board_slug=board_slug, observed_at=end)
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     holes.sort(key=lambda hole: (0 if hole["state"] != "RESOLVED" else 1, severity_order.get(hole["severity"], 99), hole["rule_id"], hole["finding_key"]))
