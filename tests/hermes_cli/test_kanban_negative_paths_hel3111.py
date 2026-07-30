@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import subprocess
 import sys
@@ -20,6 +19,8 @@ from hermes_cli import kanban_db as kb
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir()
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
@@ -67,12 +68,7 @@ def test_missing_worker_pid_is_not_falsely_reaped(kanban_home: Path) -> None:
         kb.claim_task(conn, task_id)
         assert kb.detect_crashed_workers(conn) == []
         assert _task(conn, task_id).status == "running"
-        evidence = {
-            "scenario": "missing_worker_pid",
-            "status": _task(conn, task_id).status,
-            "events": _event_kinds(conn, task_id),
-        }
-        assert json.dumps(evidence, sort_keys=True)
+        assert Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent == kanban_home
 
 
 def test_dead_pid_is_reclaimed_and_run_is_closed(
@@ -214,6 +210,7 @@ def test_late_completion_after_gave_up_is_explicit_recovery(
             conn,
             task_id,
             summary="worker completed after dispatcher gave up",
+            expected_run_id=run_id,
         )
         assert _task(conn, task_id).status == "done"
         events = kb.list_events(conn, task_id)
@@ -223,12 +220,13 @@ def test_late_completion_after_gave_up_is_explicit_recovery(
         assert recovery[0].payload["reason"] == "late_completion"
         assert recovery[0].payload["from_outcome"] == "gave_up"
         assert recovery[0].payload["to_outcome"] == "completed"
-        evidence = {
-            "scenario": "protocol_violation_then_late_completion",
-            "status": _task(conn, task_id).status,
-            "terminal_transition": recovery[0].payload,
-        }
-        assert json.dumps(evidence, sort_keys=True)
+        assert _event_kinds(conn, task_id)[-3:] == [
+            "gave_up",
+            "recovered",
+            "completed",
+        ]
+        assert _latest_run(conn, task_id).id == run_id
+        assert _latest_run(conn, task_id).outcome == "completed"
 
 
 def test_current_retry_completion_is_not_mislabeled_as_late_recovery(
@@ -263,3 +261,47 @@ def test_current_retry_completion_is_not_mislabeled_as_late_recovery(
         )
 
         assert "recovered" not in _event_kinds(conn, task_id)
+
+
+def test_late_completion_through_worker_tool_recovers_exact_gave_up_run(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker tool accepts its own gave-up run without weakening CAS."""
+    from tools import kanban_tools
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="tool late completion",
+            assignee="worker",
+            max_retries=1,
+        )
+        kb.claim_task(conn, task_id)
+        run_id = _task(conn, task_id).current_run_id
+        assert run_id is not None
+        kb._set_worker_pid(conn, task_id, 99997)
+        _rewind_task(conn, task_id, started_seconds=120)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0),
+        )
+        assert kb.detect_crashed_workers(conn) == [task_id]
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    result = kanban_tools._handle_complete(
+        {
+            "summary": "late worker tool completion",
+            "task_id": task_id,
+        }
+    )
+    assert '"ok": true' in result.lower()
+
+    with kb.connect() as conn:
+        assert _task(conn, task_id).status == "done"
+        assert _event_kinds(conn, task_id)[-3:] == [
+            "gave_up",
+            "recovered",
+            "completed",
+        ]

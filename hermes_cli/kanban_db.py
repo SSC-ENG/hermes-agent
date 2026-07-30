@@ -4763,8 +4763,17 @@ def complete_task(
         # competing terminal outcomes in the event log.
         recovery_from_gave_up = conn.execute(
             """
-            SELECT e.id AS event_id
+            SELECT e.id AS event_id,
+                   r.id AS event_run_id,
+                   r.outcome AS run_outcome
               FROM task_events e
+              LEFT JOIN task_runs r
+                ON r.id = (
+                    SELECT MAX(previous.id)
+                      FROM task_runs previous
+                     WHERE previous.task_id = e.task_id
+                       AND previous.ended_at IS NOT NULL
+                )
              WHERE e.task_id = ?
                AND e.kind = 'gave_up'
                AND NOT EXISTS (
@@ -4800,6 +4809,14 @@ def complete_task(
                 (result, now, task_id),
             )
         else:
+            expected_run_id = int(expected_run_id)
+            late_run_recovery = bool(
+                recovery_from_gave_up
+                and recovery_from_gave_up["event_run_id"] == expected_run_id
+                and recovery_from_gave_up["run_outcome"] in {
+                    "crashed", "gave_up",
+                }
+            )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4813,9 +4830,15 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
+                   AND (
+                       current_run_id = ?
+                       OR (
+                           current_run_id IS NULL
+                           AND ? = 1
+                       )
+                   )
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, now, task_id, expected_run_id, int(late_run_recovery)),
             )
         if cur.rowcount != 1:
             return False
@@ -4841,7 +4864,27 @@ def complete_task(
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
-        if run_id is None and (summary or metadata or result):
+        if run_id is None and recovery_from_gave_up and expected_run_id is not None:
+            run_id = int(expected_run_id)
+            conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'done', outcome = 'completed',
+                       summary = ?, error = NULL, metadata = ?,
+                       ended_at = ?, claim_lock = NULL,
+                       claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND task_id = ?
+                   AND outcome IN ('crashed', 'gave_up')
+                """,
+                (
+                    summary if summary is not None else result,
+                    json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                    now,
+                    run_id,
+                    task_id,
+                ),
+            )
+        elif run_id is None and (summary or metadata or result):
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
