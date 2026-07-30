@@ -4757,6 +4757,31 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # A worker can outlive the dispatcher that gave up on its task.  Keep
+        # the late completion auditable as an explicit recovery transition
+        # instead of leaving ``gave_up`` and ``completed`` as unexplained
+        # competing terminal outcomes in the event log.
+        recovery_from_gave_up = conn.execute(
+            """
+            SELECT e.id AS event_id
+              FROM task_events e
+             WHERE e.task_id = ?
+               AND e.kind = 'gave_up'
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM task_events newer
+                    WHERE newer.task_id = e.task_id
+                      AND newer.id > e.id
+                      AND newer.kind IN (
+                          'recovered', 'completed', 'unblocked',
+                          'promoted', 'promoted_manual', 'claimed'
+                      )
+               )
+             ORDER BY e.id DESC
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4822,6 +4847,19 @@ def complete_task(
                 outcome="completed",
                 summary=summary if summary is not None else result,
                 metadata=metadata,
+            )
+        if cur.rowcount == 1 and recovery_from_gave_up:
+            _append_event(
+                conn,
+                task_id,
+                "recovered",
+                {
+                    "from_outcome": "gave_up",
+                    "to_outcome": "completed",
+                    "prior_event_id": int(recovery_from_gave_up["event_id"]),
+                    "reason": "late_completion",
+                },
+                run_id=run_id,
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
