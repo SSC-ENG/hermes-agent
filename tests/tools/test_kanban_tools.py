@@ -602,6 +602,9 @@ def test_worker_lifecycle_through_tools(worker_env):
 # ---------------------------------------------------------------------------
 # System-prompt guidance injection
 # ---------------------------------------------------------------------------
+# Covered in tests/agent/test_kanban_guidance.py (KANBAN_GUIDANCE block +
+# HEL-3137 context-cost discipline assertions). Kept here as a breadcrumb so
+# greps of the kanban tools test file still find the inject surface.
 
 
 # ---------------------------------------------------------------------------
