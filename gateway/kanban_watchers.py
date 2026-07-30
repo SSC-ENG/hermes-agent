@@ -1367,7 +1367,17 @@ class GatewayKanbanWatchersMixin:
             max_in_progress: Optional[int],
             max_in_progress_per_profile: Optional[int],
         ) -> dict[str, Any]:
-            """Aggregate actionable dispatch capacity across all boards."""
+            """Aggregate actionable dispatch capacity across all boards.
+
+            Probes every board unconditionally, regardless of whether that
+            board's dispatch tick just succeeded, failed, or was skipped
+            (e.g. quarantined corrupt DB) — mirrors the pre-refactor
+            ``_ready_nonempty()`` probe, which never gated its own connect
+            attempt on the dispatch tick's outcome. Health telemetry is
+            most valuable on exactly the boards where dispatch is failing,
+            so skipping the probe there would blind the signal it exists
+            to catch.
+            """
             boards: list[dict[str, Any]] = []
             total_dispatchable = 0
             total_free_slots = 0
@@ -1376,9 +1386,6 @@ class GatewayKanbanWatchersMixin:
             probe_errors: list[dict[str, str]] = []
             for slug, _result in results or []:
                 conn = None
-                if _result is None:
-                    probe_errors.append({"slug": slug, "error": "DispatchProbeFailed"})
-                    continue
                 try:
                     conn = _kb.connect(board=slug)
                     snapshot = _kb.dispatcher_capacity_snapshot(
