@@ -188,3 +188,123 @@ def test_missing_nominal_boundary_emits_critical_review_health_hole(board):
     assert len(missed) == 1
     assert missed[0]["severity"] == "CRITICAL"
     assert missed[0]["owner"] == "rhea-ramos"
+
+
+def test_persist_review_replay_preserves_dispositioned_verified_ledger(board, tmp_path):
+    """AGA P1 #1: replaying a telemetry source must never reset the ledger.
+
+    Reproduces the exact rejected sequence: promote a telemetry finding,
+    disposition it accepted_queued, verify it, then replay the SAME
+    telemetry key through ``persist_review``. Under the old
+    ``INSERT OR REPLACE`` the replay deleted+reinserted the source row,
+    re-fired the promotion trigger, and nulled every disposition and
+    verification field while the events remained — state/event divergence
+    that reopened the orphan gate.
+    """
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="replay", triage=True)
+        _insert_event(conn, task, "intake_received", {"source_type": "paragraph", "source_ref_hash": "abc", "idempotency_key": "abc", "received_by": "haa"}, end - 4000)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        paths = telemetry.write_artifacts(report, tmp_path / "one")
+        telemetry.persist_review(conn, report, *paths)
+
+        promoted = [
+            hole["finding_key"]
+            for hole in report["holes"]
+            if hole["subject"].get("task_ids") == [task]
+        ]
+        assert promoted, "expected at least one task-scoped telemetry finding"
+        key = promoted[0]
+        assert kb.get_finding(conn, key) is not None
+
+        kb.disposition_finding(
+            conn,
+            finding_key=key,
+            disposition="accepted_queued",
+            linear_issue_id="HEL-3112",
+            actor_id="paul-park",
+        )
+        evidence = kb.fetch_linear_issue_evidence(
+            "HEL-3112",
+            transport=lambda _q, _v: {
+                "data": {
+                    "issue": {
+                        "id": "9a48515e-6535-4393-81e4-6fd6c7dc6023",
+                        "identifier": "HEL-3112",
+                        "state": {"name": "In Review"},
+                    }
+                }
+            },
+        )
+        kb.verify_finding(conn, key, actor_id="paul-park", evidence=evidence)
+
+        def ledger_row():
+            return conn.execute(
+                "SELECT * FROM findings WHERE finding_key = ?", (key,)
+            ).fetchone()
+
+        def finding_event_count():
+            return sum(
+                1
+                for event in kb.list_events(conn, task)
+                if event.payload
+                and event.payload.get("event_type", "").startswith("finding_")
+            )
+
+        def orphan_keys():
+            return {f.finding_key for f in kb.list_orphan_findings(conn)}
+
+        row_before = tuple(ledger_row())
+        # Trigger-promoted findings carry no finding_opened event (that event
+        # belongs to Python open_finding); lifecycle cardinality is 3:
+        # dispositioned, queued, verified.
+        assert finding_event_count() == 3
+        # Sibling holes from the same review remain (correctly) orphaned;
+        # the finding under test must have left the orphan gate.
+        orphans_before = orphan_keys()
+        assert key not in orphans_before
+
+        # Replay: same telemetry window persisted again (same finding_key).
+        replay = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end + 50)
+        replay_paths = telemetry.write_artifacts(replay, tmp_path / "two")
+        telemetry.persist_review(conn, replay, *replay_paths)
+
+        assert tuple(ledger_row()) == row_before
+        assert finding_event_count() == 3
+        # The replay must not reopen the gate for the verified finding nor
+        # change the orphan set at all.
+        assert orphan_keys() == orphans_before
+        assert key not in orphan_keys()
+        source_count = conn.execute(
+            "SELECT COUNT(*) FROM telemetry_review_findings WHERE finding_key = ?",
+            (key,),
+        ).fetchone()[0]
+    assert source_count == 1
+
+
+def test_persist_review_replay_updates_observation_fields_without_row_identity_loss(board, tmp_path):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="observe", triage=True)
+        _insert_event(conn, task, "intake_received", {"source_type": "paragraph", "source_ref_hash": "abc", "idempotency_key": "abc", "received_by": "haa"}, end - 4000)
+        first = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        telemetry.persist_review(conn, first, *telemetry.write_artifacts(first, tmp_path / "one"))
+        second = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end + telemetry.CADENCE_SECONDS, generated_at=end + telemetry.CADENCE_SECONDS)
+        telemetry.persist_review(conn, second, *telemetry.write_artifacts(second, tmp_path / "two"))
+        rows = conn.execute(
+            "SELECT finding_key, first_observed_at, last_observed_at, state "
+            "FROM telemetry_review_findings ORDER BY finding_key"
+        ).fetchall()
+    persisted = {row["finding_key"]: row for row in rows}
+    shared = [
+        hole["finding_key"]
+        for hole in second["holes"]
+        if hole["state"] == "PERSISTING" and hole["finding_key"] in persisted
+    ]
+    assert shared, "expected persisting findings across the two windows"
+    for key in shared:
+        row = persisted[key]
+        # Observation fields advanced monotonically on the SAME row.
+        assert row["state"] == "PERSISTING"
+        assert row["last_observed_at"] >= row["first_observed_at"]

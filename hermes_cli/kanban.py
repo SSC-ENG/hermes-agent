@@ -977,9 +977,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     f_verify.add_argument("finding_key")
     f_verify.add_argument("--actor", required=True, dest="actor_id")
-    f_verify.add_argument("--evidence-ref", required=True, dest="verification_evidence_ref")
-    f_verify.add_argument("--verification-source", required=True)
     f_verify.add_argument("--json", action="store_true")
+
+    f_decision = finding_sub.add_parser(
+        "decision", help="Durably record a rejected/deferred/not-applicable decision"
+    )
+    f_decision.add_argument("decision_ref", help="Durable decision reference")
+    f_decision.add_argument("--actor", required=True, dest="actor_id")
+    f_decision.add_argument("--rationale", required=True)
+    f_decision.add_argument("--json", action="store_true")
 
     f_list = finding_sub.add_parser("list", aliases=["ls"], help="List findings")
     f_list.add_argument("--json", action="store_true")
@@ -3181,6 +3187,7 @@ def _finding_to_dict(finding: kb.Finding) -> dict[str, Any]:
         "verified_at": finding.verified_at,
         "verification_evidence_ref": finding.verification_evidence_ref,
         "verification_source": finding.verification_source,
+        "verification_observed_state": finding.verification_observed_state,
     }
 
 
@@ -3188,7 +3195,7 @@ def _cmd_findings(args: argparse.Namespace) -> int:
     """Execute the PPMA finding-to-queue lifecycle and orphan gate."""
     action = getattr(args, "findings_action", None)
     if not action:
-        print("kanban findings: choose open, disposition, verify, list, or check",
+        print("kanban findings: choose open, disposition, verify, decision, list, or check",
               file=sys.stderr)
         return 2
 
@@ -3232,18 +3239,51 @@ def _cmd_findings(args: argparse.Namespace) -> int:
             return 0
 
         if action == "verify":
+            # The CLI path goes through the same governed adapters as the
+            # Python API: the disposition on the finding decides which
+            # adapter runs, and the typed VerifiedEvidence it returns is
+            # the only accepted proof. No free-form evidence flags exist.
+            existing = kb.get_finding(conn, args.finding_key)
+            if existing is None:
+                print(f"kanban findings: unknown finding_key {args.finding_key!r}",
+                      file=sys.stderr)
+                return 2
+            if existing.disposition in kb.ACCEPTED_FINDING_DISPOSITIONS:
+                evidence = kb.fetch_linear_issue_evidence(
+                    existing.linear_issue_id or ""
+                )
+            elif existing.disposition is not None:
+                evidence = kb.fetch_decision_record_evidence(
+                    conn, existing.decision_record_ref or ""
+                )
+            else:
+                print(f"kanban findings: {args.finding_key!r} has no disposition",
+                      file=sys.stderr)
+                return 2
             finding = kb.verify_finding(
                 conn,
                 args.finding_key,
                 actor_id=args.actor_id,
-                verification_evidence_ref=args.verification_evidence_ref,
-                verification_source=args.verification_source,
+                evidence=evidence,
             )
             payload = _finding_to_dict(finding)
             if args.json:
                 print(json.dumps(payload, indent=2, ensure_ascii=False))
             else:
                 print(f"Verified finding {finding.finding_key}")
+            return 0
+
+        if action == "decision":
+            ref = kb.record_finding_decision(
+                conn,
+                decision_ref=args.decision_ref,
+                actor_id=args.actor_id,
+                rationale=args.rationale,
+            )
+            if args.json:
+                print(json.dumps({"decision_ref": ref}, ensure_ascii=False))
+            else:
+                print(f"Recorded decision {ref}")
             return 0
 
         if action in {"list", "ls"}:

@@ -576,18 +576,45 @@ def persist_review(conn: sqlite3.Connection, report: dict[str, Any], json_path: 
 
     review = report["review"]
     with kb.write_txn(conn):
+        # True UPSERTs, never ``INSERT OR REPLACE``: SQLite's REPLACE conflict
+        # resolution is delete-then-reinsert, which (a) destroys row identity
+        # and (b) re-fires ``AFTER INSERT`` triggers on every replay. For
+        # ``telemetry_review_findings`` that re-fired the ledger-promotion
+        # trigger against an already dispositioned/verified canonical
+        # ``findings`` row. ``ON CONFLICT ... DO UPDATE`` keeps the existing
+        # row in place, so replaying a telemetry source is idempotent and can
+        # never touch canonical findings lifecycle fields.
         conn.execute(
-            "INSERT OR REPLACE INTO telemetry_review_runs "
+            "INSERT INTO telemetry_review_runs "
             "(review_id, board_slug, window_end, event_id_low_exclusive, event_id_high_inclusive, generated_at, status, json_path, markdown_path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(review_id) DO UPDATE SET "
+            "board_slug = excluded.board_slug, "
+            "window_end = excluded.window_end, "
+            "event_id_low_exclusive = excluded.event_id_low_exclusive, "
+            "event_id_high_inclusive = excluded.event_id_high_inclusive, "
+            "generated_at = excluded.generated_at, "
+            "status = excluded.status, "
+            "json_path = excluded.json_path, "
+            "markdown_path = excluded.markdown_path",
             (review["review_id"], review["board_slug"], int(datetime.fromisoformat(review["window_end_utc"].replace("Z", "+00:00")).timestamp()), review["event_id_low_exclusive"], review["event_id_high_inclusive"], int(datetime.fromisoformat(review["generated_at_utc"].replace("Z", "+00:00")).timestamp()), review["status"], str(json_path), str(markdown_path)),
         )
         for hole in report["holes"]:
             first = int(datetime.fromisoformat(hole["first_observed_at"].replace("Z", "+00:00")).timestamp())
             last = int(datetime.fromisoformat(hole["last_observed_at"].replace("Z", "+00:00")).timestamp())
             conn.execute(
-                "INSERT OR REPLACE INTO telemetry_review_findings "
+                "INSERT INTO telemetry_review_findings "
                 "(finding_key, rule_id, board_slug, subject_json, first_observed_at, last_observed_at, severity, evidence_state, state, report_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(finding_key) DO UPDATE SET "
+                "rule_id = excluded.rule_id, "
+                "board_slug = excluded.board_slug, "
+                "subject_json = excluded.subject_json, "
+                "first_observed_at = MIN(telemetry_review_findings.first_observed_at, excluded.first_observed_at), "
+                "last_observed_at = MAX(telemetry_review_findings.last_observed_at, excluded.last_observed_at), "
+                "severity = excluded.severity, "
+                "evidence_state = excluded.evidence_state, "
+                "state = excluded.state, "
+                "report_json = excluded.report_json",
                 (hole["finding_key"], hole["rule_id"], review["board_slug"], json.dumps(hole["subject"], sort_keys=True), first, last, hole["severity"], hole["evidence_state"], hole["state"], json.dumps(hole, sort_keys=True)),
             )
