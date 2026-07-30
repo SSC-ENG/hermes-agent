@@ -401,6 +401,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    # --- intake (raw work -> one triage task) ---
+    p_intake = sub.add_parser(
+        "intake", help="Normalize raw work into one governed triage task",
+    )
+    p_intake.add_argument("--text", default="", help="Paragraph, URL, or newline-separated URL pile")
+    p_intake.add_argument("--file", action="append", default=[], dest="files", help="Document path (repeatable)")
+    p_intake.add_argument("--title", default=None)
+    p_intake.add_argument("--received-by", default=None)
+    p_intake.add_argument("--priority", type=int, default=0)
+    p_intake.add_argument("--tenant", default=None)
+    p_intake.add_argument("--json", action="store_true")
+
+    # --- telemetry review ---
+    p_review = sub.add_parser(
+        "telemetry-review", help="Run the deterministic 48-hour telemetry-hole review",
+    )
+    p_review.add_argument("--window-end", type=int, default=None,
+                          help="Nominal UTC epoch boundary for deterministic replay")
+    p_review.add_argument("--output-dir", default=None)
+    p_review.add_argument("--json", action="store_true")
+
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
@@ -1044,6 +1065,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "intake":   _cmd_intake,
+            "telemetry-review": _cmd_telemetry_review,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1537,6 +1560,65 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_intake(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_intake
+
+    received_by = args.received_by or _profile_author()
+    with kb.connect_closing() as conn:
+        task_id, created = kanban_intake.receive(
+            conn,
+            text=args.text,
+            files=args.files,
+            received_by=received_by,
+            title=args.title,
+            priority=args.priority,
+            tenant=args.tenant,
+        )
+        task = kb.get_task(conn, task_id)
+    payload = {
+        "task_id": task_id,
+        "created": created,
+        "status": task.status,
+        "idempotency_key": task.idempotency_key,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        verb = "Received" if created else "Deduplicated"
+        print(f"{verb} intake {task_id} (triage)")
+    return 0
+
+
+def _cmd_telemetry_review(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_telemetry
+
+    with kb.connect_closing() as conn:
+        report = kanban_telemetry.run_review(
+            conn,
+            board_slug=kb.get_current_board(),
+            db_path=kb.kanban_db_path(),
+            window_end=args.window_end,
+        )
+    output_dir = (
+        Path(args.output_dir).expanduser()
+        if args.output_dir
+        else Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "kanban" / "reviews"
+    )
+    json_path, md_path = kanban_telemetry.write_artifacts(report, output_dir)
+    payload = {
+        "status": report["review"]["status"],
+        "json": str(json_path),
+        "markdown": str(md_path),
+        "summary": report["summary"],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Review written: {json_path}")
+        print(f"Markdown written: {md_path}")
     return 0
 
 

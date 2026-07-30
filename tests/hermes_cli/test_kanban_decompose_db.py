@@ -66,6 +66,12 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     # Second child has parents=[0] → stays in todo until c0 completes.
     assert c1.status == "todo"
     assert c1.assignee == "engineer"
+    with kb.connect() as conn:
+        child_events = kb.list_events(conn, child_ids[0])
+    created = next(event for event in child_events if event.kind == "created")
+    assert created.payload["domain"] == "UNKNOWN"
+    assert c0.current_step_key is None
+    assert c1.current_step_key is None
 
 
 def test_decompose_records_audit_comment_and_event(kanban_home):

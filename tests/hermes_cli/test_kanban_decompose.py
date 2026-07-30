@@ -88,7 +88,7 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         ],
     })
 
-    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer", "paul-park"])
     for p in patches:
         p.start()
     try:
@@ -109,7 +109,7 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert root.status == "todo"
     assert c0.status == "ready"
     assert c1.status == "todo"
-    assert c0.assignee == "researcher"
+    assert c0.assignee == "paul-park"
     assert c1.assignee == "engineer"
 
 

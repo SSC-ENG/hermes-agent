@@ -70,6 +70,7 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
+        "domain": "<short domain label, or UNKNOWN>",
         "parents": [<int>, ...]
       },
       ...
@@ -77,6 +78,10 @@ Output a single JSON object with this exact shape:
   }
 
 Rules:
+  - For fanout=true, task index 0 is ALWAYS the PPMA scoping gate. Assign it
+    to paul-park, give it no parents, and make every execution task depend on
+    index 0. Its body must require Linear parent + technical sub-issue CPTC
+    scoping before downstream execution.
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
@@ -374,6 +379,37 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
+        with kb.connect_closing() as conn:
+            resolved_assignee = assignee_val or task.assignee
+            kb._append_event(
+                conn,
+                task_id,
+                "intake_classified",
+                {"schema_version": 1, "actor": audit_author, "source": "decomposer",
+                 "correlation_id": task_id, "intake_id": task_id,
+                 "domain": "UNKNOWN", "classification": "single_task",
+                 "confidence": None, "rationale_code": "decomposer_result",
+                 "required_gates": []},
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "routing_decided",
+                {"schema_version": 1, "actor": audit_author, "source": "decomposer",
+                 "correlation_id": task_id, "intake_id": task_id,
+                 "task_id": task_id, "requested_assignee": parsed.get("assignee"),
+                 "resolved_assignee": resolved_assignee,
+                 "fallback_used": resolved_assignee != parsed.get("assignee"),
+                 "profile_exists": resolved_assignee in valid_names,
+                 "required_certification": None, "holder_verified": None},
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "decomposition_decided",
+                {"schema_version": 1, "fanout": False, "root_task_id": task_id,
+                 "child_ids": [], "dependency_edges": [], "rationale_code": "single_task"},
+            )
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False, new_title=title_val,
@@ -427,7 +463,21 @@ def decompose_task(
             "body": body.strip(),
             "assignee": chosen,
             "parents": clean_parents,
+            "domain": str(entry.get("domain") or "UNKNOWN").strip() or "UNKNOWN",
         })
+
+    if fanout:
+        children[0]["assignee"] = "paul-park"
+        children[0]["domain"] = "program-management"
+        gate_text = (
+            "Scope this intake into Linear before execution: create or verify a "
+            "plain-language parent and type:technical sub-issue(s) with CPTC. "
+            "Only after scoping, dispatch the dependent execution tasks."
+        )
+        children[0]["body"] = f"{children[0]['body']}\n\n{gate_text}".strip()
+        for idx in range(1, len(children)):
+            if 0 not in children[idx]["parents"]:
+                children[idx]["parents"].append(0)
 
     try:
         with kb.connect_closing() as conn:
@@ -448,6 +498,42 @@ def decompose_task(
     if child_ids is None:
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
+        )
+
+    with kb.connect_closing() as conn:
+        kb._append_event(
+            conn,
+            task_id,
+            "intake_classified",
+            {"schema_version": 1, "actor": audit_author, "source": "decomposer",
+             "correlation_id": task_id, "intake_id": task_id,
+             "domain": children[0].get("domain") or "UNKNOWN", "classification": "fanout",
+             "confidence": None, "rationale_code": "decomposer_result",
+             "required_gates": []},
+        )
+        for child_id, child in zip(child_ids, children):
+            kb._append_event(
+                conn,
+                child_id,
+                "routing_decided",
+                {"schema_version": 1, "actor": audit_author, "source": "decomposer",
+                 "correlation_id": task_id, "intake_id": task_id,
+                 "task_id": child_id, "requested_assignee": child.get("assignee"),
+                 "resolved_assignee": child.get("assignee"), "fallback_used": False,
+                 "profile_exists": True, "required_certification": None,
+                 "holder_verified": None},
+            )
+        kb._append_event(
+            conn,
+            task_id,
+            "decomposition_decided",
+            {"schema_version": 1, "fanout": True, "root_task_id": task_id,
+             "child_ids": child_ids,
+             "dependency_edges": [
+                 {"parent_index": p, "child_index": i}
+                 for i, child in enumerate(children) for p in child.get("parents", [])
+             ],
+             "rationale_code": "fanout"},
         )
 
     return DecomposeOutcome(
