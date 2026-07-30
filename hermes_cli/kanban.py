@@ -1608,6 +1608,8 @@ def _cmd_telemetry_review(args: argparse.Namespace) -> int:
         else Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "kanban" / "reviews"
     )
     json_path, md_path = kanban_telemetry.write_artifacts(report, output_dir)
+    with kb.connect_closing() as conn:
+        kanban_telemetry.persist_review(conn, report, json_path, md_path)
     payload = {
         "status": report["review"]["status"],
         "json": str(json_path),

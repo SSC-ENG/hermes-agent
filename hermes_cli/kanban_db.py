@@ -1247,6 +1247,31 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS telemetry_review_runs (
+    review_id               TEXT PRIMARY KEY,
+    board_slug              TEXT NOT NULL,
+    window_end              INTEGER NOT NULL,
+    event_id_low_exclusive  INTEGER NOT NULL,
+    event_id_high_inclusive INTEGER NOT NULL,
+    generated_at            INTEGER NOT NULL,
+    status                  TEXT NOT NULL,
+    json_path               TEXT,
+    markdown_path           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS telemetry_review_findings (
+    finding_key       TEXT PRIMARY KEY,
+    rule_id           TEXT NOT NULL,
+    board_slug        TEXT NOT NULL,
+    subject_json      TEXT NOT NULL,
+    first_observed_at INTEGER NOT NULL,
+    last_observed_at  INTEGER NOT NULL,
+    severity          TEXT NOT NULL,
+    evidence_state    TEXT NOT NULL,
+    state             TEXT NOT NULL,
+    report_json       TEXT NOT NULL
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1318,8 +1343,11 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_created        ON task_events(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_review_runs_boundary  ON telemetry_review_runs(board_slug, window_end);
+CREATE INDEX IF NOT EXISTS idx_review_findings_board ON telemetry_review_findings(board_slug, last_observed_at);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
