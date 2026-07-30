@@ -3503,6 +3503,18 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     import hermes_state as _hs
 
+    # This test exercises the WAL-attempt path (locking-protocol fallback),
+    # which is a different code path from the WAL-reset vulnerability guard
+    # in _apply_delete_for_wal_reset_bug. Force is_sqlite_wal_reset_vulnerable
+    # False so a vulnerable linked SQLite on the CI runner doesn't
+    # short-circuit to DELETE (and only a WARNING) before ever reaching the
+    # journal_mode=WAL pragma that _WalBlockingConnection intercepts below —
+    # without this, the test is SQLite-build-dependent instead of
+    # deterministic (passes locally on a non-vulnerable build, fails on CI's).
+    monkeypatch.setattr(
+        _hs, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: False,
+    )
+
     # The fallback warning is deduped process-globally ("once per process per
     # database" — _log_wal_fallback_once / _log_wal_reset_bug_once). Any earlier
     # test in this file that opened a kanban.db already consumed the one-shot
