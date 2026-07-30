@@ -201,3 +201,18 @@ def test_protocol_violation_first_is_high_repeat_is_critical(board):
     second_hole = next(h for h in second["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION")
     assert first_hole["severity"] == "HIGH"
     assert second_hole["severity"] == "CRITICAL"
+
+
+def test_retry_thrash_flags_two_failures_and_escalates_on_breaker(board):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="thrashing", assignee="felix-steele")
+        _insert_event(conn, task, "crashed", {"pid": 1}, end - 5000)
+        _insert_event(conn, task, "timed_out", {}, end - 3000)
+        no_breaker = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        _insert_event(conn, task, "gave_up", {"failures": 3}, end - 1000)
+        with_breaker = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole_before = next(h for h in no_breaker["holes"] if h["rule_id"] == "FAILURE.RETRY_THRASH")
+    hole_after = next(h for h in with_breaker["holes"] if h["rule_id"] == "FAILURE.RETRY_THRASH")
+    assert hole_before["severity"] == "HIGH"
+    assert hole_after["severity"] == "CRITICAL"
