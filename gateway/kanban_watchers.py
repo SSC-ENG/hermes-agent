@@ -1447,17 +1447,6 @@ class GatewayKanbanWatchersMixin:
         )
         while self._running:
             try:
-                due, boundary = _telemetry_review_due(
-                    now=int(time.time()),
-                    last_boundary=last_telemetry_review_boundary,
-                )
-                if due:
-                    await asyncio.to_thread(_telemetry_review_tick)
-                    last_telemetry_review_boundary = boundary
-            except Exception:
-                logger.exception("kanban telemetry review: scheduled cycle failed")
-
-            try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
                 pids = await asyncio.to_thread(_kb.reap_worker_zombies)
@@ -1478,6 +1467,14 @@ class GatewayKanbanWatchersMixin:
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
+                due, boundary = _telemetry_review_due(
+                    now=int(time.time()),
+                    last_boundary=last_telemetry_review_boundary,
+                )
+                healthy_board_exists = any(result is not None for _, result in (results or []))
+                if due and healthy_board_exists:
+                    await asyncio.to_thread(_telemetry_review_tick)
+                    last_telemetry_review_boundary = boundary
                 any_spawned = False
                 for slug, res in (results or []):
                     if res is not None and getattr(res, "spawned", None):
