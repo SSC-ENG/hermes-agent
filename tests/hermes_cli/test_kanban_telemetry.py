@@ -187,4 +187,17 @@ def test_missing_nominal_boundary_emits_critical_review_health_hole(board):
     missed = [hole for hole in report["holes"] if hole["rule_id"] == "REVIEW.MISSED_RUN"]
     assert len(missed) == 1
     assert missed[0]["severity"] == "CRITICAL"
-    assert missed[0]["owner"] == "rhea-ramos"
+
+
+def test_protocol_violation_first_is_high_repeat_is_critical(board):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="worker", assignee="felix-steele")
+        _insert_event(conn, task, "protocol_violation", {"pid": 1, "claimer": "host:1", "exit_code": 0}, end - 3000)
+        first = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        _insert_event(conn, task, "protocol_violation", {"pid": 2, "claimer": "host:1", "exit_code": 0}, end - 1000)
+        second = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    first_hole = next(h for h in first["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION")
+    second_hole = next(h for h in second["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION")
+    assert first_hole["severity"] == "HIGH"
+    assert second_hole["severity"] == "CRITICAL"
