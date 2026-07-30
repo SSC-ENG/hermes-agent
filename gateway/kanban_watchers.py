@@ -1183,6 +1183,9 @@ class GatewayKanbanWatchersMixin:
             `_default_spawn` see the right paths. The per-board DB is
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
+            ``dispatch_once`` also writes the typed correlation envelope at
+            each existing mutation boundary. This gateway path intentionally
+            remains only the caller, not a second telemetry writer.
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
