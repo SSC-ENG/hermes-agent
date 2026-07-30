@@ -16,6 +16,17 @@ code_task only. It is the regression test proving the dispatcher-level
 symptom (task not spawned despite headroom) is actually fixed, on top of
 the unit-level fixtures already in test_kanban_db.py
 (test_respawn_guard_ignores_pr_evidence_on_dir_task_without_branch, etc).
+
+NOTE (merge-lane, PR #13 vs main): the "dir" workspace target must exist
+on disk before dispatch_once claims the task. fork/main's
+kanban_preflight capability-gate framework (adopted by the conflict
+resolution merging this branch onto main) runs validate_pre_dispatch()
+-- which rejects a "dir" workspace whose configured path is not an
+existing directory (code "workspace_unavailable") -- BEFORE
+check_respawn_guard() ever runs. Pre-merge, this branch had no such
+precondition, so a nonexistent tmp_path subdirectory was fine. Create
+the directory so the test still reaches the guard logic under test
+rather than tripping the (unrelated, correctly-behaving) new gate.
 """
 from pathlib import Path
 import pytest
@@ -55,7 +66,11 @@ def test_active_pr_guard_wrongly_skips_non_code_ready_task_despite_headroom(
         # workspace_path must be an absolute path for workspace_kind="dir"
         # (resolve_workspace raises otherwise) -- unrelated to the guard
         # logic under test, just satisfying dispatch_once's spawn path.
+        # It must also exist on disk: kanban_preflight.validate_dispatch_candidate
+        # rejects a "dir" workspace whose path isn't a real directory
+        # (code "workspace_unavailable") before the guard under test ever runs.
         dir_workspace = tmp_path / "review-handoff-workspace"
+        dir_workspace.mkdir()
         tid = kb.create_task(
             conn,
             title="review handoff citing a PR URL",

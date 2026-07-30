@@ -2256,7 +2256,7 @@ def test_dispatch_respawn_guard_skips_recent_success(
 
 
 def test_dispatch_respawn_guard_skips_active_pr(
-    kanban_home, all_assignees_spawnable
+    kanban_home, all_assignees_spawnable, tmp_path
 ):
     """dispatch_once skips (but does not block) a task with an active PR comment."""
     spawned_ids = []
@@ -2264,9 +2264,12 @@ def test_dispatch_respawn_guard_skips_active_pr(
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
 
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
     with kb.connect() as conn:
         t = kb.create_task(
-            conn, title="has-pr", assignee="alice", workspace_kind="worktree"
+            conn, title="has-pr", assignee="alice", workspace_kind="worktree",
+            workspace_path=str(repo),
         )
         kb.add_comment(
             conn, t, "worker",
