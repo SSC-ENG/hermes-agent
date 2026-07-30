@@ -84,6 +84,7 @@ import sys
 import threading
 import logging
 import time
+from datetime import datetime, timezone
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1148,6 +1149,7 @@ class Attachment:
     content_type: Optional[str]
     size: int
     uploaded_by: Optional[str]
+    content_sha256: Optional[str]
     created_at: int
 
 
@@ -1276,7 +1278,34 @@ CREATE TABLE IF NOT EXISTS task_events (
     run_id     INTEGER,
     kind       TEXT NOT NULL,
     payload    TEXT,
+    work_intent_id TEXT,
+    idempotency_key TEXT,
     created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS telemetry_review_runs (
+    review_id               TEXT PRIMARY KEY,
+    board_slug              TEXT NOT NULL,
+    window_end              INTEGER NOT NULL,
+    event_id_low_exclusive  INTEGER NOT NULL,
+    event_id_high_inclusive INTEGER NOT NULL,
+    generated_at            INTEGER NOT NULL,
+    status                  TEXT NOT NULL,
+    json_path               TEXT,
+    markdown_path           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS telemetry_review_findings (
+    finding_key       TEXT PRIMARY KEY,
+    rule_id           TEXT NOT NULL,
+    board_slug        TEXT NOT NULL,
+    subject_json      TEXT NOT NULL,
+    first_observed_at INTEGER NOT NULL,
+    last_observed_at  INTEGER NOT NULL,
+    severity          TEXT NOT NULL,
+    evidence_state    TEXT NOT NULL,
+    state             TEXT NOT NULL,
+    report_json       TEXT NOT NULL
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -1322,6 +1351,7 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     content_type TEXT,
     size         INTEGER NOT NULL DEFAULT 0,
     uploaded_by  TEXT,
+    content_sha256 TEXT,
     created_at   INTEGER NOT NULL
 );
 
@@ -1349,8 +1379,11 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_created        ON task_events(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_review_runs_boundary  ON telemetry_review_runs(board_slug, window_end);
+CREATE INDEX IF NOT EXISTS idx_review_findings_board ON telemetry_review_findings(board_slug, last_observed_at);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -2430,6 +2463,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    attachment_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_attachments'"
+    ).fetchone()
+    if attachment_table_exists:
+        attachment_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_attachments)")
+        }
+        if "content_sha256" not in attachment_cols:
+            _add_column_if_missing(
+                conn, "task_attachments", "content_sha256", "content_sha256 TEXT"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attachments_content "
+            "ON task_attachments(task_id, content_sha256)"
+        )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -2466,6 +2515,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+    if "work_intent_id" not in ev_cols:
+        _add_column_if_missing(
+            conn, "task_events", "work_intent_id", "work_intent_id TEXT"
+        )
+    if "idempotency_key" not in ev_cols:
+        _add_column_if_missing(
+            conn, "task_events", "idempotency_key", "idempotency_key TEXT"
+        )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -2473,6 +2530,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency "
+        "ON task_events(idempotency_key) WHERE idempotency_key IS NOT NULL"
     )
 
     notify_table_exists = conn.execute(
@@ -2586,10 +2647,13 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_events ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL,"
-        " payload TEXT, created_at INTEGER NOT NULL)",
+        " payload TEXT, work_intent_id TEXT, idempotency_key TEXT,"
+        " created_at INTEGER NOT NULL)",
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE UNIQUE INDEX idx_events_idempotency "
+            "ON task_events(idempotency_key) WHERE idempotency_key IS NOT NULL",
         ),
     ),
     "task_comments": (
@@ -3380,7 +3444,14 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
+                "last_failure_error = NULL, "
+                "status = CASE "
+                "WHEN status = 'blocked' AND block_kind = 'capability' "
+                "THEN 'ready' ELSE status END, "
+                "block_kind = CASE "
+                "WHEN status = 'blocked' AND block_kind = 'capability' "
+                "THEN NULL ELSE block_kind END "
+                "WHERE id = ?",
                 (profile, task_id),
             )
         else:
@@ -3570,6 +3641,142 @@ def add_comment(
         return int(cur.lastrowid or 0)
 
 
+def add_governed_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str
+) -> int:
+    """Add a comment and recognize the structured PPMA scope contract."""
+    task = get_task(conn, task_id)
+    parsed_scope = parse_linear_scope(body)
+    if task is not None and is_ppma_scope_gate(conn, task_id) and parsed_scope is not None:
+        record_scope_handoff(conn, task_id, author=author, body=body)
+        comment = conn.execute(
+            "SELECT id FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return int(comment["id"] if comment else 0)
+    if (
+        task is not None
+        and is_ppma_scope_gate(conn, task_id)
+        and "LINEAR_SCOPE:" in body
+    ):
+        raise ValueError(
+            "PPMA scope handoff must contain LINEAR_SCOPE with at least one "
+            "{key, cptc} technical sub-issue"
+        )
+    return add_comment(conn, task_id, author, body)
+
+
+_LINEAR_SCOPE_RE = re.compile(
+    r"LINEAR_SCOPE:\s*parent=(?P<parent>[A-Z][A-Z0-9]+-\d+)\s+"
+    r"subissues=\[(?P<subissues>.+)\]",
+    re.DOTALL,
+)
+_LINEAR_SUBISSUE_RE = re.compile(
+    r"(?:key\s*[:=]\s*)?(?P<key>[A-Z][A-Z0-9]+-\d+)\s*"
+    r"[,;]\s*cptc\s*[:=]\s*(?P<cptc>1|2|3|5|8|13)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_linear_scope(body: str) -> Optional[dict]:
+    """Parse PPMA's structured Linear/CPTC handoff, or return ``None``."""
+    match = _LINEAR_SCOPE_RE.search(body or "")
+    if not match:
+        return None
+    subissues = [
+        {"key": item.group("key").upper(), "cptc": int(item.group("cptc"))}
+        for item in _LINEAR_SUBISSUE_RE.finditer(match.group("subissues"))
+    ]
+    if not subissues:
+        return None
+    return {"parent": match.group("parent").upper(), "subissues": subissues}
+
+
+def record_scope_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: str,
+    body: str,
+) -> dict:
+    """Persist a validated PPMA scope comment and typed handoff events."""
+    scope = parse_linear_scope(body)
+    if scope is None:
+        raise ValueError(
+            "PPMA scope handoff must contain LINEAR_SCOPE with at least one "
+            "{key, cptc} technical sub-issue"
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise ValueError(f"unknown task {task_id}")
+        if task["assignee"] != "paul-park" or not is_ppma_scope_gate(conn, task_id):
+            raise ValueError("scope handoff is only valid for a PPMA gate task")
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'scope_recorded'",
+            (task_id,),
+        ).fetchone()
+        if existing:
+            return scope
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, author.strip(), body.strip(), now),
+        )
+        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        payload = {"schema_version": 1, **scope, "recorded_by": author.strip()}
+        _append_event(conn, task_id, "scope_recorded", payload)
+        gate_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'ppma_scope_gate' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        gate_payload = json.loads(gate_event["payload"] or "{}") if gate_event else {}
+        root_task_id = gate_payload.get("root_task_id")
+        downstream = conn.execute(
+            "SELECT t.id, t.assignee FROM tasks t "
+            "JOIN task_links l ON l.child_id = t.id "
+            "WHERE l.parent_id = ? AND t.id != ? ORDER BY t.id",
+            (task_id, root_task_id or ""),
+        ).fetchall()
+        for child in downstream:
+            _append_event(
+                conn,
+                child["id"],
+                "handoff_emitted",
+                {
+                    "schema_version": 1,
+                    "actor": author.strip(),
+                    "source": "ppma_scope_gate",
+                    "correlation_id": root_task_id or task_id,
+                    "handoff_id": f"{task_id}:{child['id']}:linear_scope",
+                    "from_owner": "paul-park",
+                    "to_owner": child["assignee"],
+                    "artifact_refs": [
+                        scope["parent"],
+                        *[item["key"] for item in scope["subissues"]],
+                    ],
+                    "acceptance_contract": "validated_linear_scope",
+                    "next_expected_event": "handoff_accepted",
+                    "due_by": None,
+                    "scope_parent": scope["parent"],
+                },
+            )
+    return scope
+
+
+def is_ppma_scope_gate(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether this task is the marked task-0 PPMA scope gate."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'ppma_scope_gate' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
@@ -3678,6 +3885,13 @@ def store_attachment_bytes(
             f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
         )
     safe_name = _safe_attachment_name(filename)
+    content_sha256 = hashlib.sha256(data).hexdigest()
+    existing = conn.execute(
+        "SELECT id FROM task_attachments WHERE task_id = ? AND content_sha256 = ? LIMIT 1",
+        (task_id, content_sha256),
+    ).fetchone()
+    if existing:
+        return int(existing["id"])
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
@@ -3691,6 +3905,7 @@ def store_attachment_bytes(
             content_type=content_type,
             size=len(data),
             uploaded_by=uploaded_by,
+            content_sha256=content_sha256,
         )
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
@@ -3711,6 +3926,7 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
+    content_sha256: Optional[str] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
@@ -3728,10 +3944,17 @@ def add_attachment(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        if content_sha256:
+            existing = conn.execute(
+                "SELECT id FROM task_attachments WHERE task_id = ? AND content_sha256 = ? LIMIT 1",
+                (task_id, content_sha256),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
         cur = conn.execute(
             "INSERT INTO task_attachments "
-            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(task_id, filename, stored_path, content_type, size, uploaded_by, content_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 filename.strip(),
@@ -3739,6 +3962,7 @@ def add_attachment(
                 content_type,
                 int(size),
                 uploaded_by,
+                content_sha256,
                 now,
             ),
         )
@@ -3765,6 +3989,7 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             content_type=r["content_type"],
             size=r["size"] or 0,
             uploaded_by=r["uploaded_by"],
+            content_sha256=(r["content_sha256"] if "content_sha256" in r.keys() else None),
             created_at=r["created_at"],
         )
         for r in rows
@@ -3785,6 +4010,7 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         content_type=r["content_type"],
         size=r["size"] or 0,
         uploaded_by=r["uploaded_by"],
+        content_sha256=(r["content_sha256"] if "content_sha256" in r.keys() else None),
         created_at=r["created_at"],
     )
 
@@ -3854,11 +4080,95 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
+    work_intent_id = payload.get("work_intent_id") if payload else None
+    idempotency_key = payload.get("idempotency_key") if payload else None
     conn.execute(
-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, pl, now),
+        "INSERT OR IGNORE INTO task_events "
+        "(task_id, run_id, kind, payload, work_intent_id, idempotency_key, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_id, run_id, kind, pl, work_intent_id, idempotency_key, now),
     )
+
+
+_WORK_INTENT_EVENT_TYPES = frozenset({
+    "task_claimed",
+    "worker_spawn_requested",
+    "worker_spawned",
+    "worker_started",
+    "heartbeat",
+    "worker_exited",
+})
+_WORK_INTENT_POLICY_VERSION = "HEL-3110-v1"
+
+
+def _utc_source_time(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _append_work_intent_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    event_type: str,
+    *,
+    run_id: Optional[int],
+    from_state: str,
+    to_state: str,
+    reason_code: str,
+    source_event_id: str,
+    idempotency_key: str,
+    actor_type: str = "service",
+    actor_id: str = "kanban-dispatcher",
+    causation_event_id: Optional[str] = None,
+    occurred_at: Optional[float] = None,
+) -> None:
+    """Append one minimized, replay-safe dispatcher lifecycle event."""
+    if event_type not in _WORK_INTENT_EVENT_TYPES:
+        raise ValueError(f"unsupported work-intent event type: {event_type}")
+    source_time = occurred_at if occurred_at is not None else time.time()
+    task = conn.execute(
+        "SELECT assignee, session_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    payload = {
+        "event_id": f"evt_{secrets.token_hex(16)}",
+        "occurred_at": _utc_source_time(source_time),
+        "recorded_at": _utc_source_time(time.time()),
+        "event_type": event_type,
+        "source_system": "kanban",
+        "source_event_id": source_event_id or "UNKNOWN",
+        "work_intent_id": task_id,
+        "task_id": task_id,
+        "run_id": run_id,
+        "session_id": task["session_id"] if task else None,
+        "linear_issue_id": None,
+        "repo": None,
+        "pr_number": None,
+        "head_sha": None,
+        "deployment_id": None,
+        "environment": None,
+        "deployed_sha": None,
+        "actor_type": actor_type,
+        "actor_id": (
+            task["assignee"]
+            if actor_type == "profile" and task and task["assignee"]
+            else actor_id
+        ),
+        "node_id": _claimer_id().split(":", 1)[0],
+        "from_state": from_state or "UNKNOWN",
+        "to_state": to_state or "UNKNOWN",
+        "reason_code": reason_code,
+        "causation_event_id": causation_event_id,
+        "idempotency_key": idempotency_key,
+        "evidence_ref": f"task:{task_id}/run:{run_id or 'UNKNOWN'}",
+        "policy_version": _WORK_INTENT_POLICY_VERSION,
+        "schema_version": 1,
+    }
+    # Keep legacy ``heartbeat`` rows backward-compatible. The governed typed
+    # event is identified by its envelope's event_type, avoiding a duplicate
+    # legacy heartbeat kind for one source mutation.
+    storage_kind = "work_intent_heartbeat" if event_type == "heartbeat" else event_type
+    _append_event(conn, task_id, storage_kind, payload, run_id=run_id)
 
 
 def _end_run(
@@ -3887,7 +4197,7 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
-    conn.execute(
+    cur = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -3911,6 +4221,20 @@ def _end_run(
             now,
             run_id,
         ),
+    )
+    if cur.rowcount != 1:
+        return None
+    _append_work_intent_event(
+        conn,
+        task_id,
+        "worker_exited",
+        run_id=run_id,
+        from_state="running",
+        to_state=outcome,
+        reason_code=outcome,
+        source_event_id=f"run:{run_id}:exit:{outcome}",
+        idempotency_key=f"work-intent:{task_id}:run:{run_id}:worker_exited",
+        actor_type="profile",
     )
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
@@ -4060,7 +4384,19 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            preflight_event = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? "
+                "AND kind IN ('pre_dispatch_validation_failed', 'unblocked') "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            preflight_blocked = bool(
+                preflight_event
+                and preflight_event["kind"] == "pre_dispatch_validation_failed"
+            )
+            if cur_status == "blocked" and (
+                _has_sticky_block(conn, task_id) or preflight_blocked
+            ):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
@@ -4100,7 +4436,16 @@ def recompute_ready(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
-                _append_event(conn, task_id, "promoted", None)
+                parent_rows = conn.execute(
+                    "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                    (task_id,),
+                ).fetchall()
+                _append_event(conn, task_id, "promoted", {
+                    "from_status": cur_status,
+                    "to_status": "ready",
+                    "trigger": "parents_terminal",
+                    "satisfied_parent_ids": [p["parent_id"] for p in parent_rows],
+                })
                 promoted += 1
     return promoted
 
@@ -4220,6 +4565,17 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        _append_work_intent_event(
+            conn,
+            task_id,
+            "task_claimed",
+            run_id=run_id,
+            from_state="ready",
+            to_state="running",
+            reason_code="dispatch_claim",
+            source_event_id=f"run:{run_id}:claim",
+            idempotency_key=f"work-intent:{task_id}:run:{run_id}:task_claimed",
+        )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -4302,6 +4658,17 @@ def claim_review_task(
             {"lock": lock, "expires": expires, "run_id": run_id,
              "source_status": "review"},
             run_id=run_id,
+        )
+        _append_work_intent_event(
+            conn,
+            task_id,
+            "task_claimed",
+            run_id=run_id,
+            from_state="review",
+            to_state="running",
+            reason_code="review_dispatch_claim",
+            source_event_id=f"run:{run_id}:claim",
+            idempotency_key=f"work-intent:{task_id}:run:{run_id}:task_claimed",
         )
         return get_task(conn, task_id)
 
@@ -4759,6 +5126,28 @@ def complete_task(
     """
     now = int(time.time())
 
+    # A decomposed task-0 scope gate is not complete until PPMA records the
+    # structured Linear/CPTC scope. This check sits in the shared DB writer so
+    # CLI, tools, dashboard, and administrative callers cannot bypass it.
+    if is_ppma_scope_gate(conn, task_id):
+        scope = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'scope_recorded' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if scope is None:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_scope",
+                    {
+                        "schema_version": 1,
+                        "reason": "scope_recorded_required",
+                    },
+                )
+            return False
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -4790,6 +5179,40 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # A worker can outlive the dispatcher that gave up on its task.  Keep
+        # the late completion auditable as an explicit recovery transition
+        # instead of leaving ``gave_up`` and ``completed`` as unexplained
+        # competing terminal outcomes in the event log.
+        recovery_from_gave_up = conn.execute(
+            """
+            SELECT e.id AS event_id,
+                   r.id AS event_run_id,
+                   r.outcome AS run_outcome
+              FROM task_events e
+              LEFT JOIN task_runs r
+                ON r.id = (
+                    SELECT MAX(previous.id)
+                      FROM task_runs previous
+                     WHERE previous.task_id = e.task_id
+                       AND previous.ended_at IS NOT NULL
+                )
+             WHERE e.task_id = ?
+               AND e.kind = 'gave_up'
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM task_events newer
+                    WHERE newer.task_id = e.task_id
+                      AND newer.id > e.id
+                      AND newer.kind IN (
+                          'recovered', 'completed', 'unblocked',
+                          'promoted', 'promoted_manual', 'claimed'
+                      )
+               )
+             ORDER BY e.id DESC
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4808,6 +5231,14 @@ def complete_task(
                 (result, now, task_id),
             )
         else:
+            expected_run_id = int(expected_run_id)
+            late_run_recovery = bool(
+                recovery_from_gave_up
+                and recovery_from_gave_up["event_run_id"] == expected_run_id
+                and recovery_from_gave_up["run_outcome"] in {
+                    "crashed", "gave_up",
+                }
+            )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4821,9 +5252,15 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
+                   AND (
+                       current_run_id = ?
+                       OR (
+                           current_run_id IS NULL
+                           AND ? = 1
+                       )
+                   )
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, now, task_id, expected_run_id, int(late_run_recovery)),
             )
         if cur.rowcount != 1:
             return False
@@ -4849,12 +5286,45 @@ def complete_task(
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
-        if run_id is None and (summary or metadata or result):
+        if run_id is None and recovery_from_gave_up and expected_run_id is not None:
+            run_id = int(expected_run_id)
+            conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'done', outcome = 'completed',
+                       summary = ?, error = NULL, metadata = ?,
+                       ended_at = ?, claim_lock = NULL,
+                       claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND task_id = ?
+                   AND outcome IN ('crashed', 'gave_up')
+                """,
+                (
+                    summary if summary is not None else result,
+                    json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                    now,
+                    run_id,
+                    task_id,
+                ),
+            )
+        elif run_id is None and (summary or metadata or result):
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
                 summary=summary if summary is not None else result,
                 metadata=metadata,
+            )
+        if cur.rowcount == 1 and recovery_from_gave_up:
+            _append_event(
+                conn,
+                task_id,
+                "recovered",
+                {
+                    "from_outcome": "gave_up",
+                    "to_outcome": "completed",
+                    "prior_event_id": int(recovery_from_gave_up["event_id"]),
+                    "reason": "late_completion",
+                },
+                run_id=run_id,
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
@@ -6099,8 +6569,21 @@ def decompose_triage_task(
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {"by": author or "decomposer", "from_decompose_of": task_id,
+                 "domain": child.get("domain") or "UNKNOWN",
+                 "created_by": author or "decomposer"},
             )
+            if idx == 0 and child.get("ppma_scope_gate") is True:
+                _append_event(
+                    conn,
+                    new_id,
+                    "ppma_scope_gate",
+                    {
+                        "schema_version": 1,
+                        "root_task_id": task_id,
+                        "gate_index": 0,
+                    },
+                )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
 
@@ -6174,7 +6657,88 @@ def decompose_triage_task(
     return child_ids
 
 
+def create_governed_intake_task(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    body: str,
+    tenant: str,
+    content_digest: str,
+    idempotency_key: str,
+    created_by: Optional[str] = None,
+    priority: int = 0,
+) -> tuple[str, bool]:
+    """Atomically deduplicate and create one governed raw-intake task.
+
+    ``create_task`` intentionally has legacy best-effort idempotency semantics.
+    Governed intake needs a stronger contract because duplicate webhook/feed
+    deliveries may race. Serialize the lookup+insert under one write transaction
+    without changing the compatibility behavior of the general task API.
+    """
+    if not content_digest or not content_digest.strip():
+        raise ValueError("governed intake requires a content_digest")
+    if not idempotency_key or not idempotency_key.strip():
+        raise ValueError("governed intake requires an idempotency_key")
+    content_digest = content_digest.strip()
+    idempotency_key = idempotency_key.strip()
+    now = int(time.time())
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if existing:
+            existing_task = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?", (existing["id"],)
+            ).fetchone()
+            if existing_task is None or content_digest not in (existing_task["body"] or ""):
+                raise ValueError("idempotency_key is already used for different intake content")
+            return existing["id"], False
+        digest_match = conn.execute(
+            "SELECT id FROM tasks WHERE body LIKE ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (f"%{content_digest}%",),
+        ).fetchone()
+        if digest_match:
+            return digest_match["id"], False
+        task_id = _new_task_id()
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, body, status, workspace_kind, tenant, priority, "
+            " created_at, created_by, idempotency_key) "
+            "VALUES (?, ?, ?, 'triage', 'scratch', ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                title.strip(),
+                body,
+                tenant.strip(),
+                int(priority),
+                now,
+                created_by,
+                idempotency_key,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "created",
+            {"by": created_by, "assignee": None, "status": "triage", "parents": []},
+        )
+        return task_id, True
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    # A PPMA task-0 gate must not be bypassed through archive because archived
+    # parents satisfy dependency readiness just like done parents.
+    if is_ppma_scope_gate(conn, task_id):
+        scope = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'scope_recorded' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if scope is None:
+            return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -6234,8 +6798,18 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     This keeps the operation atomic (single ``write_txn``).
 
     Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
+    if the task was not found or is an unsatisfied PPMA scope gate.
     """
+    # Deleting an unsatisfied PPMA gate would remove its dependency edges, and
+    # the trailing recompute would incorrectly make execution children ready.
+    if is_ppma_scope_gate(conn, task_id):
+        scope = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'scope_recorded' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if scope is None:
+            return False
     with write_txn(conn):
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
@@ -6713,8 +7287,14 @@ class DispatchResult:
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready/review task ids skipped because their assignee is not an
     installed Hermes profile. Each real (non-dry-run) skip also emits a
-    deduplicated ``dispatch_nonspawnable_assignee`` event so the failure is
-    durable and machine-readable instead of silently leaving work queued."""
+    deduplicated ``pre_dispatch_validation_failed`` event
+    (``error_code=missing_assignee_profile``, via ``reject_pre_dispatch``)
+    so the failure is durable and machine-readable instead of silently
+    leaving work queued."""
+    pre_dispatch_failed: list[tuple[str, str]] = field(default_factory=list)
+    """Task ids rejected by the pre-claim capability gate, paired with the
+    stable failure code. A rejected task is blocked before a run is created
+    and is not retried until an operator changes the task or node state."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -7169,8 +7749,22 @@ def heartbeat_worker(
             )
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            {"note": note, "activity_kind": "worker_liveness"},
             run_id=run_id,
+        )
+        heartbeat_source_id = f"run:{run_id}:heartbeat:{time.time_ns()}"
+        _append_work_intent_event(
+            conn,
+            task_id,
+            "heartbeat",
+            run_id=run_id,
+            from_state="running",
+            to_state="running",
+            reason_code="worker_liveness",
+            source_event_id=heartbeat_source_id,
+            idempotency_key=f"work-intent:{task_id}:{heartbeat_source_id}",
+            actor_type="profile",
+            occurred_at=float(now),
         )
     return True
 
@@ -8023,6 +8617,30 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        source_id = f"run:{run_id}:pid:{int(pid)}"
+        _append_work_intent_event(
+            conn,
+            task_id,
+            "worker_spawned",
+            run_id=run_id,
+            from_state="spawn_requested",
+            to_state="spawned",
+            reason_code="process_created",
+            source_event_id=source_id,
+            idempotency_key=f"work-intent:{task_id}:run:{run_id}:worker_spawned",
+        )
+        _append_work_intent_event(
+            conn,
+            task_id,
+            "worker_started",
+            run_id=run_id,
+            from_state="spawned",
+            to_state="running",
+            reason_code="pid_recorded",
+            source_event_id=source_id,
+            idempotency_key=f"work-intent:{task_id}:run:{run_id}:worker_started",
+            actor_type="profile",
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8497,54 +9115,69 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    def record_nonspawnable(task_id: str, assignee: str, task_status: str) -> None:
-        """Persist one actionable event for a missing-profile assignment.
-
-        Dispatcher ticks are frequent, so identical unresolved failures are
-        deduplicated. Reassignment (or a later transition back into the same
-        bad assignment) changes the task's event stream and permits a fresh
-        signal without producing one event per tick.
-        """
+    def reject_pre_dispatch(task: Task, failure: Any) -> None:
+        """Block one invalid candidate before claim and emit one durable event."""
+        result.pre_dispatch_failed.append((task.id, failure.code))
         if dry_run:
             return
-        error = (
-            f"Assignee profile {assignee!r} does not exist; create that Hermes "
-            "profile or reassign the task to an installed profile."
-        )
-        # Ignore unrelated comments/diagnostic events when deduplicating, but
-        # let an explicit reassignment reset the signal so assigning back to
-        # the same missing name is reported again.
-        latest = conn.execute(
-            "SELECT kind, payload FROM task_events WHERE task_id = ? "
-            "AND kind IN ('dispatch_nonspawnable_assignee', 'assigned') "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if latest is not None and latest["kind"] == "dispatch_nonspawnable_assignee":
-            try:
-                prior = json.loads(latest["payload"] or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                prior = {}
-            if (
-                prior.get("assignee") == assignee
-                and prior.get("task_status") == task_status
-                and prior.get("error_code") == "missing_assignee_profile"
-            ):
-                return
         with write_txn(conn):
+            latest = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "AND kind IN ('pre_dispatch_validation_failed', 'assigned', 'unblocked') "
+                "ORDER BY id DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            if latest is not None and latest["kind"] == "pre_dispatch_validation_failed":
+                try:
+                    prior = json.loads(latest["payload"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    prior = {}
+                if prior.get("error_code") == failure.code:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                        "last_failure_error = ? WHERE id = ? AND status IN ('ready', 'review')",
+                        (failure.message[:500], task.id),
+                    )
+                    return
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "last_failure_error = ? WHERE id = ? AND status IN ('ready', 'review')",
+                (failure.message[:500], task.id),
+            )
+            payload = {
+                "outcome": "dispatch_rejected",
+                "error_code": failure.code,
+                "error": failure.message,
+                "action": failure.action,
+                "assignee": task.assignee,
+                "task_status": task.status,
+            }
+            if failure.requirement:
+                payload["requirement"] = failure.requirement
             _append_event(
                 conn,
-                task_id,
-                "dispatch_nonspawnable_assignee",
-                {
-                    "outcome": "dispatch_failed",
-                    "error_code": "missing_assignee_profile",
-                    "error": error,
-                    "assignee": assignee,
-                    "task_status": task_status,
-                    "action": "create_profile_or_reassign",
-                },
+                task.id,
+                "pre_dispatch_validation_failed",
+                payload,
             )
+
+    def validate_pre_dispatch(task: Task) -> bool:
+        from hermes_cli.kanban_preflight import validate_dispatch_candidate
+
+        board_slug = board if board else get_current_board()
+        failure = validate_dispatch_candidate(
+            task,
+            runtime_argv=_resolve_hermes_argv(),
+            board_default_workdir=(
+                read_board_metadata(board_slug).get("default_workdir") or None
+            ),
+            scratch_root=workspaces_root(board=board),
+        )
+        if failure is None:
+            return True
+        reject_pre_dispatch(task, failure)
+        return False
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -8680,7 +9313,25 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
             result.skipped_nonspawnable.append(row["id"])
-            record_nonspawnable(row["id"], row_assignee, "ready")
+            candidate = get_task(conn, row["id"])
+            if candidate is not None:
+                from hermes_cli.kanban_preflight import PreDispatchFailure
+
+                reject_pre_dispatch(
+                    candidate,
+                    PreDispatchFailure(
+                        code="missing_assignee_profile",
+                        message=(
+                            f"Assignee profile {row_assignee!r} does not exist; "
+                            "create that Hermes profile or reassign the task."
+                        ),
+                        action="create_profile_or_reassign",
+                        requirement=row_assignee,
+                    ),
+                )
+            continue
+        candidate = get_task(conn, row["id"])
+        if candidate is None or not validate_pre_dispatch(candidate):
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -8750,6 +9401,21 @@ def _dispatch_once_locked(
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        with write_txn(conn):
+            run_id = _current_run_id(conn, claimed.id)
+            _append_work_intent_event(
+                conn,
+                claimed.id,
+                "worker_spawn_requested",
+                run_id=run_id,
+                from_state="claimed",
+                to_state="spawn_requested",
+                reason_code="dispatcher_actuation",
+                source_event_id=f"run:{run_id}:spawn_request",
+                idempotency_key=(
+                    f"work-intent:{claimed.id}:run:{run_id}:worker_spawn_requested"
+                ),
+            )
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -8817,7 +9483,25 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
-            record_nonspawnable(row["id"], row["assignee"], "review")
+            candidate = get_task(conn, row["id"])
+            if candidate is not None:
+                from hermes_cli.kanban_preflight import PreDispatchFailure
+
+                reject_pre_dispatch(
+                    candidate,
+                    PreDispatchFailure(
+                        code="missing_assignee_profile",
+                        message=(
+                            f"Assignee profile {row['assignee']!r} does not exist; "
+                            "create that Hermes profile or reassign the task."
+                        ),
+                        action="create_profile_or_reassign",
+                        requirement=row["assignee"],
+                    ),
+                )
+            continue
+        candidate = get_task(conn, row["id"])
+        if candidate is None or not validate_pre_dispatch(candidate):
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
@@ -8862,6 +9546,21 @@ def _dispatch_once_locked(
         # review agent needs.
         claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        with write_txn(conn):
+            run_id = _current_run_id(conn, claimed.id)
+            _append_work_intent_event(
+                conn,
+                claimed.id,
+                "worker_spawn_requested",
+                run_id=run_id,
+                from_state="claimed",
+                to_state="spawn_requested",
+                reason_code="review_dispatch_actuation",
+                source_event_id=f"run:{run_id}:spawn_request",
+                idempotency_key=(
+                    f"work-intent:{claimed.id}:run:{run_id}:worker_spawn_requested"
+                ),
+            )
         try:
             import inspect
             try:

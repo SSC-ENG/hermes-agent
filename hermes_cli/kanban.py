@@ -401,6 +401,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    # --- intake (raw work -> one triage task) ---
+    p_intake = sub.add_parser(
+        "intake", help="Normalize raw work into one governed triage task",
+    )
+    p_intake.add_argument("--text", default="", help="Paragraph, URL, or newline-separated URL pile")
+    p_intake.add_argument("--file", action="append", default=[], dest="files", help="Document path (repeatable)")
+    p_intake.add_argument("--title", default=None)
+    p_intake.add_argument("--received-by", default=None)
+    p_intake.add_argument("--priority", type=int, default=0)
+    p_intake.add_argument("--tenant", default=None)
+    p_intake.add_argument("--json", action="store_true")
+
+    # --- telemetry review ---
+    p_review = sub.add_parser(
+        "telemetry-review", help="Run the deterministic 48-hour telemetry-hole review",
+    )
+    p_review.add_argument("--window-end", type=int, default=None,
+                          help="Nominal UTC epoch boundary for deterministic replay")
+    p_review.add_argument("--output-dir", default=None)
+    p_review.add_argument("--json", action="store_true")
+
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
@@ -1044,6 +1065,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "intake":   _cmd_intake,
+            "telemetry-review": _cmd_telemetry_review,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1496,30 +1519,50 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
-        )
+        intake_envelope = None
+        if getattr(args, "triage", False) and args.body:
+            from hermes_cli import kanban_intake
+            try:
+                intake_envelope = kanban_intake.parse_envelope(args.body)
+            except ValueError as exc:
+                print(f"kanban: invalid intake envelope: {exc}", file=sys.stderr)
+                return 2
+        if intake_envelope:
+            task_id, _ = kb.create_governed_intake_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                tenant=intake_envelope.tenant_domain,
+                content_digest=intake_envelope.content_digest,
+                idempotency_key=intake_envelope.idempotency_key,
+                created_by=args.created_by or _profile_author(),
+                priority=args.priority,
+            )
+        else:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                project_id=getattr(args, "project", None),
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+            )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
@@ -1537,6 +1580,62 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_intake(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_intake
+
+    received_by = args.received_by or _profile_author()
+    with kb.connect_closing() as conn:
+        task_id, created = kanban_intake.receive(
+            conn,
+            text=args.text,
+            files=args.files,
+            received_by=received_by,
+            title=args.title,
+            priority=args.priority,
+            tenant=args.tenant,
+        )
+        task = kb.get_task(conn, task_id)
+    payload = {
+        "task_id": task_id,
+        "created": created,
+        "status": task.status,
+        "idempotency_key": task.idempotency_key,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        verb = "Received" if created else "Deduplicated"
+        print(f"{verb} intake {task_id} (triage)")
+    return 0
+
+
+def _cmd_telemetry_review(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_telemetry
+
+    output_dir = (
+        Path(args.output_dir).expanduser()
+        if args.output_dir
+        else None
+    )
+    report, json_path, md_path = kanban_telemetry.run_scheduled_review(
+        board_slug=kb.get_current_board(),
+        window_end=args.window_end,
+        output_dir=output_dir,
+    )
+    payload = {
+        "status": report["review"]["status"],
+        "json": str(json_path),
+        "markdown": str(md_path),
+        "summary": report["summary"],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Review written: {json_path}")
+        print(f"Markdown written: {md_path}")
     return 0
 
 
@@ -2043,7 +2142,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kb.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_governed_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
     return 0
 

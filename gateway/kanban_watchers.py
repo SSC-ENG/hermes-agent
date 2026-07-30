@@ -116,6 +116,18 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _telemetry_review_due(
+    *,
+    now: int,
+    last_boundary: int | None,
+) -> tuple[bool, int]:
+    """Return whether the current nominal review boundary needs a run."""
+    from hermes_cli import kanban_telemetry
+
+    boundary = kanban_telemetry.nominal_window_end(now)
+    return boundary != last_boundary, boundary
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -1206,6 +1218,8 @@ class GatewayKanbanWatchersMixin:
         def _persist_health(snapshot: dict[str, Any]) -> None:
             """Persist health without allowing telemetry to stop dispatch."""
             _persist_dispatcher_health(_kb.write_dispatcher_health, snapshot)
+
+        last_telemetry_review_boundary: int | None = None
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1246,6 +1260,9 @@ class GatewayKanbanWatchersMixin:
             `_default_spawn` see the right paths. The per-board DB is
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
+            ``dispatch_once`` also writes the typed correlation envelope at
+            each existing mutation boundary. This gateway path intentionally
+            remains only the caller, not a second telemetry writer.
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
@@ -1403,6 +1420,21 @@ class GatewayKanbanWatchersMixin:
                 "degraded": bool(probe_errors) or not results,
             }
 
+        def _telemetry_review_tick() -> None:
+            """Run one persisted review cycle for every active board."""
+            from hermes_cli import kanban_telemetry as _telemetry
+
+            results = _telemetry.run_scheduled_reviews(now=int(time.time()))
+            for slug, report, json_path, markdown_path in results:
+                logger.info(
+                    "kanban telemetry review [%s]: status=%s holes=%d json=%s markdown=%s",
+                    slug,
+                    report["review"]["status"],
+                    len(report["holes"]),
+                    json_path,
+                    markdown_path,
+                )
+
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
         # ``kanban.auto_decompose`` (default True). Capped by
@@ -1524,6 +1556,14 @@ class GatewayKanbanWatchersMixin:
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
+                due, boundary = _telemetry_review_due(
+                    now=int(time.time()),
+                    last_boundary=last_telemetry_review_boundary,
+                )
+                healthy_board_exists = any(result is not None for _, result in (results or []))
+                if due and healthy_board_exists:
+                    await asyncio.to_thread(_telemetry_review_tick)
+                    last_telemetry_review_boundary = boundary
                 any_spawned = False
                 for slug, res in (results or []):
                     if res is not None and getattr(res, "spawned", None):

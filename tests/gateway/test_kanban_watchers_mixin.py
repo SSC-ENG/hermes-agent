@@ -8,13 +8,16 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 from __future__ import annotations
 
 import inspect
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from gateway.kanban_watchers import (
     DISPATCHER_HEALTH_WINDOW,
     GatewayKanbanWatchersMixin,
     _next_dispatcher_health,
     _persist_dispatcher_health,
+    _telemetry_review_due,
 )
 
 KANBAN_METHODS = [
@@ -160,3 +163,18 @@ def test_health_persistence_failure_does_not_change_dispatch_result(
     assert _persist_dispatcher_health(fail_write, {"status": "ok"}) is False
     assert spawned == [task_id]
     assert result.spawned[0][0] == task_id
+
+
+def test_telemetry_review_runs_once_per_nominal_boundary():
+    phoenix = ZoneInfo("America/Phoenix")
+    now = int(datetime(2026, 7, 30, 12, 30, tzinfo=phoenix).timestamp())
+
+    due, boundary = _telemetry_review_due(now=now, last_boundary=None)
+    duplicate_due, duplicate_boundary = _telemetry_review_due(
+        now=now,
+        last_boundary=boundary,
+    )
+
+    assert due is True
+    assert duplicate_due is False
+    assert duplicate_boundary == boundary

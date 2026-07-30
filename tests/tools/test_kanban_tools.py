@@ -371,6 +371,59 @@ def test_comment_happy_path(worker_env):
         conn.close()
 
 
+def test_comment_records_linear_scope_for_ppma_gate(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="raw", triage=True)
+        gate, execution = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="paul-park",
+            children=[
+                {
+                    "title": "scope",
+                    "assignee": "paul-park",
+                    "parents": [],
+                    "domain": "program-management",
+                    "ppma_scope_gate": True,
+                },
+                {
+                    "title": "build",
+                    "assignee": "test-worker",
+                    "parents": [0],
+                    "domain": "engineering",
+                },
+            ],
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_PROFILE", "paul-park")
+    out = kt._handle_comment({
+        "task_id": gate,
+        "body": (
+            "Completed scope.\nLINEAR_SCOPE: parent=HEL-3107 "
+            "subissues=[{key:HEL-3115, cptc:3}]"
+        ),
+    })
+    assert json.loads(out)["ok"] is True
+    conn = kb.connect()
+    try:
+        assert "scope_recorded" in {
+            event.kind for event in kb.list_events(conn, gate)
+        }
+        handoffs = [
+            event for event in kb.list_events(conn, execution)
+            if event.kind == "handoff_emitted"
+        ]
+    finally:
+        conn.close()
+    assert handoffs[0].payload["to_owner"] == "test-worker"
+
+
 def test_comment_ignores_caller_supplied_author(worker_env):
     """``args["author"]`` is no longer honored — the author is always
     derived from ``HERMES_PROFILE`` so a worker can't forge a comment
