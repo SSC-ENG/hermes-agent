@@ -6490,6 +6490,25 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+def _is_os_agnostic_absolute(raw: str) -> bool:
+    """Return True if ``raw`` is an absolute path under *any* mainstream OS.
+
+    ``pathlib.Path.is_absolute()`` is OS-dependent: a POSIX-style path like
+    ``/Users/dan/repo`` (no drive letter) is absolute on POSIX but NOT on
+    Windows, where ``WindowsPath('/Users/...').is_absolute()`` returns False.
+    In a mixed-host dispatch fleet (Mac authors the task, a Windows
+    control-plane host resolves the workspace) that mismatch raised a false
+    "non-absolute workspace_path" error and killed every dir: task on spawn.
+
+    We accept a path as absolute if EITHER interpretation says so:
+    POSIX (leading ``/``) or Windows (drive-letter / UNC). This validates the
+    author's intent regardless of which OS runs the resolver.
+    """
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    return PurePosixPath(raw).is_absolute() or PureWindowsPath(raw).is_absolute()
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -6523,7 +6542,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
             # same absolute-path guard as dir: — consistent with the
             # threat model.
             p = Path(task.workspace_path).expanduser()
-            if not p.is_absolute():
+            if not _is_os_agnostic_absolute(task.workspace_path):
                 raise ValueError(
                     f"task {task.id} has non-absolute workspace_path "
                     f"{task.workspace_path!r}; workspace paths must be absolute"
@@ -6538,7 +6557,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"task {task.id} has workspace_kind=dir but no workspace_path"
             )
         p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
+        if not _is_os_agnostic_absolute(task.workspace_path):
             raise ValueError(
                 f"task {task.id} has non-absolute workspace_path "
                 f"{task.workspace_path!r}; use an absolute path "
@@ -6665,7 +6684,7 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
-_RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
+_RESPAWN_GUARD_PR_WINDOW = 3600  # 1 hour (HAA 2026-07-29 option B: the prior 24h window suppressed 12/16 ready tasks because merge-lane work posts PR URLs constantly; combined with the code-task scoping in check_respawn_guard this keeps duplicate-PR protection without starving the board)
 
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
