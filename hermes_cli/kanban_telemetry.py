@@ -82,6 +82,7 @@ def _implementation_sha() -> str:
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=5,
             check=False,
         )
