@@ -511,6 +511,32 @@ def run_review(
             observed_at=latest["created_at"],
         ))
 
+    for task_id, task in tasks.items():
+        if task["status"] != "blocked" or not task["block_kind"]:
+            continue
+        block_events = [e for e in by_task.get(task_id, []) if e["kind"] in {"blocked", "block_loop_detected"}]
+        if not block_events:
+            continue
+        blocked_since = block_events[-1]["created_at"]
+        age = end - blocked_since
+        if age < BLOCKED_AGED_MEDIUM_SECONDS:
+            continue
+        if age >= BLOCKED_AGED_CRITICAL_SECONDS:
+            severity = "CRITICAL"
+        elif age >= BLOCKED_AGED_HIGH_SECONDS:
+            severity = "HIGH"
+        else:
+            severity = "MEDIUM"
+        holes.append(_finding(
+            "STALL.BLOCKED_AGED", board_slug,
+            _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity=severity,
+            evidence_state="MEASURED", title="Typed human block has aged without a decision",
+            owner=task["assignee"] or "OWNER.UNRESOLVED",
+            recommendation="Record a decision or unblock event for this typed block.",
+            evidence=[{"event_ids": [block_events[-1]["id"]], "query_id": "Q-STALL-01", "fact": f"Blocked for {age} seconds since {_utc(blocked_since)}."}],
+            observed_at=blocked_since,
+        ))
+
     holes = _apply_prior_states(conn, holes, board_slug=board_slug, observed_at=end)
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     holes.sort(key=lambda hole: (0 if hole["state"] != "RESOLVED" else 1, severity_order.get(hole["severity"], 99), hole["rule_id"], hole["finding_key"]))
