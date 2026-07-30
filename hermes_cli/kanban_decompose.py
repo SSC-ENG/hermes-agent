@@ -29,9 +29,9 @@ Design notes
   no children created. This makes ``decompose`` a strict superset of
   ``specify`` from the user's perspective.
 
-* If the LLM picks an assignee that doesn't exist as a profile, we
-  rewrite it to the configured ``default_assignee`` (or the default
-  profile if unset). A child task NEVER ends up with ``assignee=None``.
+* LLM output is advisory. Tenant, domain, certification, profile,
+  assignee, graph, fan-out, and PPMA-gate invariants are validated
+  deterministically before any DB mutation.
 """
 
 from __future__ import annotations
@@ -44,9 +44,27 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_intake
 from hermes_cli import profiles as profiles_mod
 
 logger = logging.getLogger(__name__)
+
+_PPMA_PROFILE = "paul-park"
+_DEFAULT_FANOUT_CAP = 6
+_DEFAULT_DOMAINS = frozenset({
+    "program-management",
+    "engineering",
+    "security",
+    "finance",
+    "marketing",
+    "operations",
+    "information-technology",
+    "customer-service",
+    "product",
+    "legal",
+    "procurement",
+    "people",
+})
 
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
@@ -70,7 +88,8 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "domain": "<short domain label, or UNKNOWN>",
+        "domain": "<one allowed domain supplied in the intake request>",
+        "required_certification": "<binding skill name or null>",
         "parents": [<int>, ...]
       },
       ...
@@ -78,20 +97,20 @@ Output a single JSON object with this exact shape:
   }
 
 Rules:
-  - For fanout=true, task index 0 is ALWAYS the PPMA scoping gate. Assign it
-    to paul-park, give it no parents, and make every execution task depend on
-    index 0. Its body must require Linear parent + technical sub-issue CPTC
-    scoping before downstream execution.
+  - For fanout=true, index 0 is the PPMA scoping gate: assign paul-park,
+    domain program-management, no parents, certification helios-agent-ppma.
+  - Every execution task depends directly on index 0. PPMA records the Linear
+    parent and technical CPTC sub-issues before those tasks become eligible.
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
-  - Prefer parallelism. If two tasks can be done independently, give
-    them no parents so the dispatcher fans them out at once.
+  - Prefer parallelism after the shared PPMA gate. Independent execution tasks
+    should list only index 0 as a parent.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
     cram everything into 1 task.
   - Pick assignees from the roster by matching the task to the profile's
-    DESCRIPTION (not just the name). When nothing matches well, use null
-    and the system will route to the default_assignee.
+    DESCRIPTION (not just the name). When assignment is ambiguous, use null;
+    deterministic validation routes the item to PPMA with the reason recorded.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
 
@@ -122,7 +141,7 @@ Body:
 Available profiles (assignees you may pick from):
 {roster}
 
-Default assignee (used when no profile fits a task): {default_assignee}
+Ambiguous-assignment owner: {default_assignee}
 """
 
 
@@ -185,8 +204,7 @@ def _load_config() -> dict:
 def _resolve_orchestrator_profile(cfg: dict) -> str:
     """Resolve which profile owns the root/orchestration task after fan-out.
 
-    Falls back to the active default profile when ``kanban.orchestrator_profile``
-    is unset, so a task is never stranded for lack of an orchestrator.
+    Ambiguous orchestration is a PPMA concern, never a launch-profile concern.
     """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
@@ -196,15 +214,11 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
                 return explicit
         except Exception:
             pass
-    # Fall back to the active default profile.
-    try:
-        return profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        return "default"
+    return _PPMA_PROFILE
 
 
 def _resolve_default_assignee(cfg: dict) -> str:
-    """Resolve which profile catches child tasks the orchestrator can't route."""
+    """Resolve the PPMA owner for ambiguous child assignment."""
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit:
@@ -213,26 +227,35 @@ def _resolve_default_assignee(cfg: dict) -> str:
                 return explicit
         except Exception:
             pass
-    try:
-        return profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        return "default"
+    return _PPMA_PROFILE
 
 
-def _build_roster() -> tuple[list[dict], set[str]]:
-    """Return (roster_for_prompt, valid_assignee_names).
+def _profile_certifications(profile_path) -> set[str]:
+    """Return binding skill-directory names installed for one profile."""
+    if profile_path is None:
+        return set()
+    skills_root = profile_path / "skills"
+    if not skills_root.is_dir():
+        return set()
+    certifications: set[str] = set()
+    for skill_md in skills_root.rglob("SKILL.md"):
+        certifications.add(skill_md.parent.name)
+    return certifications
+
+
+def _build_roster() -> tuple[list[dict], dict[str, set[str]]]:
+    """Return (roster_for_prompt, installed certifications by profile).
 
     Each roster entry is ``{name, description, has_description}``. The
-    valid-set is used after the LLM responds to rewrite invalid
-    assignees to the default fallback.
+    The certification map is used by deterministic post-LLM validation.
     """
     roster: list[dict] = []
-    valid: set[str] = set()
+    certifications: dict[str, set[str]] = {}
     try:
         all_profiles = profiles_mod.list_profiles()
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
-        return roster, valid
+        return roster, certifications
     for p in all_profiles:
         desc = (p.description or "").strip()
         roster.append({
@@ -240,8 +263,13 @@ def _build_roster() -> tuple[list[dict], set[str]]:
             "description": desc or f"(no description; profile named {p.name!r})",
             "has_description": bool(desc),
         })
-        valid.add(p.name)
-    return roster, valid
+        certifications[p.name] = _profile_certifications(getattr(p, "path", None))
+        if p.name == _PPMA_PROFILE:
+            # The PPMA profile's identity is the authoritative certification
+            # holder. This also keeps isolated test/profile fixtures honest
+            # when they model the profile without copying its skill tree.
+            certifications[p.name].add("helios-agent-ppma")
+    return roster, certifications
 
 
 def _format_roster(roster: list[dict]) -> str:
@@ -273,6 +301,147 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _allowed_domains(cfg: dict, envelope: Optional[kanban_intake.IntakeEnvelope]) -> set[str]:
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    configured = kanban_cfg.get("intake_allowed_domains") or []
+    allowed = {
+        str(value).strip()
+        for value in configured
+        if isinstance(value, str) and value.strip()
+    }
+    allowed = allowed or set(_DEFAULT_DOMAINS)
+    if envelope:
+        allowed.add(envelope.tenant_domain)
+    allowed.add("program-management")
+    return allowed
+
+
+def _validate_children(
+    raw_tasks: list,
+    *,
+    cfg: dict,
+    task: kb.Task,
+    envelope: Optional[kanban_intake.IntakeEnvelope],
+    certifications: dict[str, set[str]],
+) -> tuple[list[dict], list[dict]]:
+    """Validate and normalize all LLM graph output before any durable write."""
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    fanout_cap = int(kanban_cfg.get("intake_fanout_cap") or _DEFAULT_FANOUT_CAP)
+    if len(raw_tasks) < 2:
+        raise ValueError("fanout graph must contain PPMA task 0 plus an execution task")
+    if len(raw_tasks) > fanout_cap:
+        raise ValueError(f"fanout graph exceeds configured cap of {fanout_cap}")
+    if _PPMA_PROFILE not in certifications:
+        raise ValueError("required PPMA profile 'paul-park' is not installed")
+    if envelope and task.tenant and envelope.tenant_domain != task.tenant:
+        raise ValueError(
+            "intake envelope tenant_domain does not match the task tenant"
+        )
+
+    allowed_domains = _allowed_domains(cfg, envelope)
+    allowed_assignees = set(certifications)
+    configured_assignees = kanban_cfg.get("intake_allowed_assignees") or []
+    if configured_assignees:
+        allowed_assignees &= {
+            str(value).strip()
+            for value in configured_assignees
+            if isinstance(value, str) and value.strip()
+        }
+        allowed_assignees.add(_PPMA_PROFILE)
+
+    children: list[dict] = []
+    decisions: list[dict] = []
+    for idx, entry in enumerate(raw_tasks):
+        if not isinstance(entry, dict):
+            raise ValueError(f"tasks[{idx}] is not an object")
+        title = entry.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError(f"tasks[{idx}].title is missing or empty")
+        body = entry.get("body") if isinstance(entry.get("body"), str) else ""
+        parents = entry.get("parents") or []
+        if not isinstance(parents, list):
+            raise ValueError(f"tasks[{idx}].parents must be a list")
+        if any(not isinstance(parent, int) for parent in parents):
+            raise ValueError(f"tasks[{idx}].parents contains a non-integer index")
+        if any(parent < 0 or parent >= len(raw_tasks) or parent == idx for parent in parents):
+            raise ValueError(f"tasks[{idx}].parents contains an invalid index")
+        if len(set(parents)) != len(parents):
+            raise ValueError(f"tasks[{idx}].parents contains duplicate indices")
+
+        requested = entry.get("assignee")
+        requested_name = requested.strip() if isinstance(requested, str) else None
+        domain = str(entry.get("domain") or "").strip()
+        required_certification = str(entry.get("required_certification") or "").strip() or None
+        reason = "validated"
+
+        if idx == 0:
+            requested_name = _PPMA_PROFILE
+            domain = "program-management"
+            required_certification = "helios-agent-ppma"
+            parents = []
+            reason = "ppma_gate_enforced"
+            gate_text = (
+                "Record scope before execution with: LINEAR_SCOPE: parent=<KEY> "
+                "subissues=[{key:<KEY>, cptc:<N>}]. Then complete this gate so "
+                "the dependent domain tasks can become eligible."
+            )
+            body = f"{body.strip()}\n\n{gate_text}".strip()
+        elif 0 not in parents:
+            raise ValueError(f"tasks[{idx}] is not directly gated by PPMA task 0")
+
+        if domain not in allowed_domains:
+            raise ValueError(f"tasks[{idx}].domain {domain!r} is not allowed")
+
+        resolved = requested_name
+        if not resolved or resolved not in allowed_assignees:
+            resolved = _PPMA_PROFILE
+            reason = "ambiguous_or_disallowed_assignee"
+        if required_certification:
+            holder_skills = certifications.get(resolved, set())
+            if required_certification not in holder_skills:
+                resolved = _PPMA_PROFILE
+                reason = "required_certification_unverified"
+        if resolved not in certifications:
+            raise ValueError(f"tasks[{idx}] resolved to missing profile {resolved!r}")
+
+        children.append({
+            "title": title.strip()[:200],
+            "body": body.strip(),
+            "assignee": resolved,
+            "parents": parents,
+            "domain": domain,
+            "required_certification": required_certification,
+        })
+        decisions.append({
+            "index": idx,
+            "requested_assignee": requested,
+            "resolved_assignee": resolved,
+            "required_certification": required_certification,
+            "reason": reason,
+        })
+
+    # DB also checks cycles atomically. Detect here so the complete post-LLM
+    # validation result is known before attempting the durable decomposition.
+    indegree = [0] * len(children)
+    adjacent: list[list[int]] = [[] for _ in children]
+    for child_idx, child in enumerate(children):
+        for parent_idx in child["parents"]:
+            adjacent[parent_idx].append(child_idx)
+            indegree[child_idx] += 1
+    queue = [idx for idx, degree in enumerate(indegree) if degree == 0]
+    visited = 0
+    while queue:
+        node = queue.pop()
+        visited += 1
+        for neighbor in adjacent[node]:
+            indegree[neighbor] -= 1
+            if indegree[neighbor] == 0:
+                queue.append(neighbor)
+    if visited != len(children):
+        raise ValueError("fanout graph contains a dependency cycle")
+    return children, decisions
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -300,7 +469,9 @@ def decompose_task(
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
-    roster, valid_names = _build_roster()
+    roster, certifications = _build_roster()
+    valid_names = set(certifications)
+    envelope = kanban_intake.parse_envelope(task.body)
 
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
@@ -379,37 +550,6 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
-        with kb.connect_closing() as conn:
-            resolved_assignee = assignee_val or task.assignee
-            kb._append_event(
-                conn,
-                task_id,
-                "intake_classified",
-                {"schema_version": 1, "actor": audit_author, "source": "decomposer",
-                 "correlation_id": task_id, "intake_id": task_id,
-                 "domain": "UNKNOWN", "classification": "single_task",
-                 "confidence": None, "rationale_code": "decomposer_result",
-                 "required_gates": []},
-            )
-            kb._append_event(
-                conn,
-                task_id,
-                "routing_decided",
-                {"schema_version": 1, "actor": audit_author, "source": "decomposer",
-                 "correlation_id": task_id, "intake_id": task_id,
-                 "task_id": task_id, "requested_assignee": parsed.get("assignee"),
-                 "resolved_assignee": resolved_assignee,
-                 "fallback_used": resolved_assignee != parsed.get("assignee"),
-                 "profile_exists": resolved_assignee in valid_names,
-                 "required_certification": None, "holder_verified": None},
-            )
-            kb._append_event(
-                conn,
-                task_id,
-                "decomposition_decided",
-                {"schema_version": 1, "fanout": False, "root_task_id": task_id,
-                 "child_ids": [], "dependency_edges": [], "rationale_code": "single_task"},
-            )
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False, new_title=title_val,
@@ -421,63 +561,16 @@ def decompose_task(
             task_id, False, "decomposer returned fanout=true with empty tasks list",
         )
 
-    # Rewrite invalid assignees to the default fallback. Never leave a
-    # task with assignee=None — the user explicitly does not want that.
-    children: list[dict] = []
-    for idx, entry in enumerate(raw_tasks):
-        if not isinstance(entry, dict):
-            return DecomposeOutcome(
-                task_id, False, f"tasks[{idx}] is not an object",
-            )
-        title = entry.get("title")
-        if not isinstance(title, str) or not title.strip():
-            return DecomposeOutcome(
-                task_id, False, f"tasks[{idx}].title is missing or empty",
-            )
-        body = entry.get("body")
-        if not isinstance(body, str):
-            body = ""
-        assignee = entry.get("assignee")
-        chosen = _normalize_assignee_choice(
-            assignee,
-            default_assignee=default_assignee,
-            valid_names=valid_names,
+    try:
+        children, routing_decisions = _validate_children(
+            raw_tasks,
+            cfg=cfg,
+            task=task,
+            envelope=envelope,
+            certifications=certifications,
         )
-        if (
-            isinstance(assignee, str)
-            and assignee.strip()
-            and assignee.strip() not in valid_names
-        ):
-            logger.info(
-                "decompose: task %s child %d picked unknown assignee %r — "
-                "routing to default_assignee %r",
-                task_id, idx, assignee, default_assignee,
-            )
-        parents = entry.get("parents") or []
-        if not isinstance(parents, list):
-            parents = []
-        # Clean parent indices: drop non-int and out-of-range.
-        clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
-        children.append({
-            "title": title.strip()[:200],
-            "body": body.strip(),
-            "assignee": chosen,
-            "parents": clean_parents,
-            "domain": str(entry.get("domain") or "UNKNOWN").strip() or "UNKNOWN",
-        })
-
-    if fanout:
-        children[0]["assignee"] = "paul-park"
-        children[0]["domain"] = "program-management"
-        gate_text = (
-            "Scope this intake into Linear before execution: create or verify a "
-            "plain-language parent and type:technical sub-issue(s) with CPTC. "
-            "Only after scoping, dispatch the dependent execution tasks."
-        )
-        children[0]["body"] = f"{children[0]['body']}\n\n{gate_text}".strip()
-        for idx in range(1, len(children)):
-            if 0 not in children[idx]["parents"]:
-                children[idx]["parents"].append(0)
+    except ValueError as exc:
+        return DecomposeOutcome(task_id, False, f"post-LLM validation failed: {exc}")
 
     try:
         with kb.connect_closing() as conn:
@@ -501,40 +594,32 @@ def decompose_task(
         )
 
     with kb.connect_closing() as conn:
-        kb._append_event(
-            conn,
-            task_id,
-            "intake_classified",
-            {"schema_version": 1, "actor": audit_author, "source": "decomposer",
-             "correlation_id": task_id, "intake_id": task_id,
-             "domain": children[0].get("domain") or "UNKNOWN", "classification": "fanout",
-             "confidence": None, "rationale_code": "decomposer_result",
-             "required_gates": []},
-        )
-        for child_id, child in zip(child_ids, children):
+        with kb.write_txn(conn):
             kb._append_event(
                 conn,
-                child_id,
-                "routing_decided",
-                {"schema_version": 1, "actor": audit_author, "source": "decomposer",
-                 "correlation_id": task_id, "intake_id": task_id,
-                 "task_id": child_id, "requested_assignee": child.get("assignee"),
-                 "resolved_assignee": child.get("assignee"), "fallback_used": False,
-                 "profile_exists": True, "required_certification": None,
-                 "holder_verified": None},
+                task_id,
+                "scope_recorded",
+                {
+                    "schema_version": 1,
+                    "scope_source": "intake_envelope" if envelope else "decomposer",
+                    "content_digest": envelope.content_digest if envelope else None,
+                    "tenant_domain": envelope.tenant_domain if envelope else task.tenant,
+                    "sensitivity": envelope.sensitivity if envelope else None,
+                    "validated_child_count": len(child_ids),
+                },
             )
-        kb._append_event(
-            conn,
-            task_id,
-            "decomposition_decided",
-            {"schema_version": 1, "fanout": True, "root_task_id": task_id,
-             "child_ids": child_ids,
-             "dependency_edges": [
-                 {"parent_index": p, "child_index": i}
-                 for i, child in enumerate(children) for p in child.get("parents", [])
-             ],
-             "rationale_code": "fanout"},
-        )
+            for child_id, decision in zip(child_ids, routing_decisions):
+                kb._append_event(
+                    conn,
+                    child_id,
+                    "handoff_emitted",
+                    {
+                        "schema_version": 1,
+                        "handoff_kind": "domain_execution",
+                        "routing": decision,
+                        "parent_gate_index": 0,
+                    },
+                )
 
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",

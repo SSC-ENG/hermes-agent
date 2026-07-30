@@ -2176,6 +2176,11 @@ DEFAULT_CONFIG = {
         # assignee to any installed profile. When unset, falls back to the
         # default profile. A task never ends up with assignee=None.
         "default_assignee": "",
+        # Governed raw-intake rules. Empty values use the built-in safe
+        # vocabulary and route ambiguity to PPMA, never the launch profile.
+        "intake_fanout_cap": 6,
+        "intake_allowed_domains": [],
+        "intake_allowed_assignees": [],
         # Per-profile concurrency cap (#21582). When set to a positive int,
         # no single profile can have more than N workers running at once,
         # even if the global max_in_progress / max_spawn caps would allow

@@ -1,12 +1,10 @@
-"""Governed raw-work intake for the Kanban triage column.
-
-This module deliberately normalizes input only. Classification and routing remain
-owned by ``kanban_decompose`` and the gateway's existing auto-decomposer.
-"""
+"""Canonical raw-work envelope for the existing Kanban triage/decomposer path."""
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
@@ -14,8 +12,152 @@ from urllib.parse import urlsplit, urlunsplit
 
 from hermes_cli import kanban_db as kb
 
+_PREFIX = "INTAKE-ENVELOPE v1\n"
+_SUFFIX = "\nEND-INTAKE-ENVELOPE"
+_SENSITIVITIES = frozenset({"public", "internal", "confidential", "restricted"})
 _LINEAR_URL_RE = re.compile(r"https?://(?:www\.)?linear\.app/[^\s]+/issue/[A-Za-z][A-Za-z0-9_-]*-\d+(?:/[^\s]*)?", re.I)
 _URL_RE = re.compile(r"https?://[^\s]+", re.I)
+
+
+@dataclass(frozen=True)
+class IntakeEnvelope:
+    source: str
+    items: tuple[str, ...]
+    notes: str
+    attachment_refs: tuple[str, ...]
+    content_digest: str
+    tenant_domain: str
+    sensitivity: str
+    idempotency_key: str
+
+    def to_dict(self) -> dict:
+        return {
+            "source": self.source,
+            "items": list(self.items),
+            "notes": self.notes,
+            "attachment_refs": list(self.attachment_refs),
+            "content_digest": self.content_digest,
+            "tenant_domain": self.tenant_domain,
+            "sensitivity": self.sensitivity,
+            "idempotency_key": self.idempotency_key,
+        }
+
+
+def _clean_list(values: Iterable[str], *, field: str, required: bool = False) -> tuple[str, ...]:
+    cleaned = tuple(str(value).strip() for value in values if str(value).strip())
+    if required and not cleaned:
+        raise ValueError(f"intake envelope {field} must contain at least one value")
+    return cleaned
+
+
+def _digest_payload(
+    *,
+    source: str,
+    items: tuple[str, ...],
+    notes: str,
+    attachment_refs: tuple[str, ...],
+    tenant_domain: str,
+    sensitivity: str,
+) -> str:
+    payload = {
+        "attachment_refs": list(attachment_refs),
+        "items": list(items),
+        "notes": notes,
+        "sensitivity": sensitivity,
+        "source": source,
+        "tenant_domain": tenant_domain,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def build_envelope(
+    *,
+    source: str,
+    items: Iterable[str],
+    notes: str = "",
+    attachment_refs: Iterable[str] = (),
+    tenant_domain: str,
+    sensitivity: str = "internal",
+    idempotency_key: Optional[str] = None,
+) -> IntakeEnvelope:
+    source = str(source).strip()
+    tenant_domain = str(tenant_domain).strip()
+    sensitivity = str(sensitivity).strip().lower()
+    if not source:
+        raise ValueError("intake envelope source is required")
+    if not tenant_domain:
+        raise ValueError("intake envelope tenant_domain is required")
+    if sensitivity not in _SENSITIVITIES:
+        raise ValueError(
+            f"intake envelope sensitivity must be one of {sorted(_SENSITIVITIES)}"
+        )
+    clean_items = _clean_list(items, field="items", required=True)
+    clean_refs = _clean_list(attachment_refs, field="attachment_refs")
+    clean_notes = str(notes or "").strip()
+    digest = _digest_payload(
+        source=source,
+        items=clean_items,
+        notes=clean_notes,
+        attachment_refs=clean_refs,
+        tenant_domain=tenant_domain,
+        sensitivity=sensitivity,
+    )
+    key = str(idempotency_key or digest).strip()
+    if not key:
+        raise ValueError("intake envelope idempotency_key is required")
+    return IntakeEnvelope(
+        source=source,
+        items=clean_items,
+        notes=clean_notes,
+        attachment_refs=clean_refs,
+        content_digest=digest,
+        tenant_domain=tenant_domain,
+        sensitivity=sensitivity,
+        idempotency_key=key,
+    )
+
+
+def render_envelope(envelope: IntakeEnvelope) -> str:
+    payload = json.dumps(envelope.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
+    return f"{_PREFIX}{payload}{_SUFFIX}"
+
+
+def parse_envelope(body: Optional[str]) -> Optional[IntakeEnvelope]:
+    text = body or ""
+    start = text.find(_PREFIX)
+    if start < 0:
+        return None
+    payload_start = start + len(_PREFIX)
+    end = text.find(_SUFFIX, payload_start)
+    if end < 0:
+        raise ValueError("intake envelope is missing END-INTAKE-ENVELOPE")
+    try:
+        raw = json.loads(text[payload_start:end])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"intake envelope JSON is invalid: {exc.msg}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("intake envelope payload must be an object")
+    supplied_digest = str(raw.get("content_digest") or "").strip()
+    supplied_key = str(raw.get("idempotency_key") or "").strip()
+    raw_items = raw.get("items")
+    raw_attachment_refs = raw.get("attachment_refs")
+    envelope = build_envelope(
+        source=raw.get("source") or "",
+        items=raw_items if isinstance(raw_items, list) else (),
+        notes=raw.get("notes") or "",
+        attachment_refs=(
+            raw_attachment_refs if isinstance(raw_attachment_refs, list) else ()
+        ),
+        tenant_domain=raw.get("tenant_domain") or "",
+        sensitivity=raw.get("sensitivity") or "",
+        idempotency_key=supplied_key,
+    )
+    if supplied_digest != envelope.content_digest:
+        raise ValueError("intake envelope content_digest does not match canonical content")
+    if not supplied_key:
+        raise ValueError("intake envelope idempotency_key is required")
+    return envelope
 
 
 def _normalize_url(value: str) -> str:
@@ -24,7 +166,6 @@ def _normalize_url(value: str) -> str:
 
 
 def normalize_raw_ref(text: str) -> str:
-    """Normalize raw text for stable idempotency without changing stored input."""
     lines = [line.strip() for line in (text or "").splitlines()]
     return "\n".join(lines).strip()
 
@@ -69,7 +210,7 @@ def idempotency_key(kind: str, text: str, files: Iterable[Path]) -> str:
     return hashlib.sha256(f"{kind}\n{ref}".encode("utf-8")).hexdigest()
 
 
-def build_envelope(*, kind: str, raw_ref_sha256: str, received_by: str, text: str, attachment_ids: list[int]) -> str:
+def _legacy_envelope(*, kind: str, raw_ref_sha256: str, received_by: str, text: str, attachment_ids: list[int]) -> str:
     received_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     header = "\n".join([
         "---",
@@ -80,7 +221,7 @@ def build_envelope(*, kind: str, raw_ref_sha256: str, received_by: str, text: st
         f"intake_attachment_ids: {attachment_ids}",
         "---",
     ])
-    return f"{header}\n{ text }" if text else f"{header}\n"
+    return f"{header}\n{text}" if text else f"{header}\n"
 
 
 def receive(
@@ -94,7 +235,8 @@ def receive(
     tenant: Optional[str] = None,
     board: Optional[str] = None,
 ) -> tuple[str, bool]:
-    paths = [Path(p).expanduser() for p in files]
+    """Backward-compatible CLI intake entry point."""
+    paths = [Path(path).expanduser() for path in files]
     for path in paths:
         if not path.is_file():
             raise ValueError(f"intake file does not exist: {path}")
@@ -103,31 +245,44 @@ def receive(
     kind = source_type(text, paths)
     digest = raw_hash(text, paths)
     key = idempotency_key(kind, text, paths)
-    title = title or (f"Raw intake: {kind}")
-    existing_before = conn.execute(
-        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1", (key,)
+    title = title or f"Raw intake: {kind}"
+    existing = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1",
+        (key,),
     ).fetchone()
     task_id = kb.create_task(
-        conn, title=title, body=build_envelope(
-            kind=kind, raw_ref_sha256=digest, received_by=received_by,
-            text=text, attachment_ids=[],
-        ), created_by=received_by, priority=priority, tenant=tenant,
-        triage=True, idempotency_key=key,
+        conn,
+        title=title,
+        body=_legacy_envelope(kind=kind, raw_ref_sha256=digest, received_by=received_by, text=text, attachment_ids=[]),
+        created_by=received_by,
+        priority=priority,
+        tenant=tenant,
+        triage=True,
+        idempotency_key=key,
     )
-    created = existing_before is None
-    attachment_ids: list[int] = []
-    for path in paths:
-        attachment_ids.append(kb.store_attachment_bytes(
-            conn, task_id, path.name, path.read_bytes(),
-            content_type=None, uploaded_by=received_by, board=board,
-        ))
+    created = existing is None
+    attachment_ids = [
+        kb.store_attachment_bytes(
+            conn,
+            task_id,
+            path.name,
+            path.read_bytes(),
+            content_type=None,
+            uploaded_by=received_by,
+            board=board,
+        )
+        for path in paths
+    ]
     if created:
-        envelope = build_envelope(
-            kind=kind, raw_ref_sha256=digest, received_by=received_by,
-            text=text, attachment_ids=attachment_ids,
+        body = _legacy_envelope(
+            kind=kind,
+            raw_ref_sha256=digest,
+            received_by=received_by,
+            text=text,
+            attachment_ids=attachment_ids,
         )
         with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (envelope, task_id))
+            conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, task_id))
             kb._append_event(conn, task_id, "intake_received", {
                 "schema_version": 1,
                 "actor": received_by,

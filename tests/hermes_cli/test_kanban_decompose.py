@@ -83,8 +83,9 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         "fanout": True,
         "rationale": "test split",
         "tasks": [
-            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+            {"title": "scope", "body": "scope it", "assignee": "paul-park", "domain": "program-management", "parents": []},
+            {"title": "research", "body": "look it up", "assignee": "researcher", "domain": "engineering", "parents": [0]},
+            {"title": "build", "body": "code it", "assignee": "engineer", "domain": "engineering", "parents": [0]},
         ],
     })
 
@@ -100,17 +101,20 @@ def test_decompose_with_fanout_creates_children(kanban_home):
 
     assert outcome.ok, outcome.reason
     assert outcome.fanout is True
-    assert outcome.child_ids and len(outcome.child_ids) == 2
+    assert outcome.child_ids and len(outcome.child_ids) == 3
 
     with kb.connect() as conn:
         root = kb.get_task(conn, tid)
         c0 = kb.get_task(conn, outcome.child_ids[0])
         c1 = kb.get_task(conn, outcome.child_ids[1])
+        c2 = kb.get_task(conn, outcome.child_ids[2])
     assert root.status == "todo"
     assert c0.status == "ready"
     assert c1.status == "todo"
+    assert c2.status == "todo"
     assert c0.assignee == "paul-park"
-    assert c1.assignee == "engineer"
+    assert c1.assignee == "researcher"
+    assert c2.assignee == "engineer"
 
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
