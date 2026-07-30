@@ -248,6 +248,10 @@ def _runtime_failure(runtime_argv: Optional[Sequence[str]]) -> Optional[PreDispa
         if os.path.isabs(executable)
         else shutil.which(executable) is not None
     )
+    # ``sys.executable -m hermes_cli.main`` is the dispatcher's intentional
+    # fallback when no console-script shim is on PATH. The interpreter was
+    # already validated above; remaining argv entries are arguments, not
+    # executables.
     if not executable_available:
         return PreDispatchFailure(
             code="missing_worker_runtime",
@@ -356,7 +360,8 @@ def validate_dispatch_candidate(
     profile_dir = get_profile_dir(assignee)
     skills = _profile_skill_files(profile_dir)
     certifications = _binding_certifications(profile_dir)
-    if not certifications:
+    soul_path = profile_dir / "SOUL.md"
+    if assignee != "default" and soul_path.is_file() and not certifications:
         return PreDispatchFailure(
             code="missing_profile_certification",
             message=f"Assignee profile {assignee!r} declares no binding certification.",
