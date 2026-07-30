@@ -5871,6 +5871,27 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+        # Count the reclaim against the unified failure counter so repeated
+        # stale-TTL reclaims trip the circuit breaker (HEL-3135). Timeout /
+        # crash paths already funnel here; without this call a task can loop
+        # ready→running→reclaimed forever while consecutive_failures stays
+        # at 0. Outside the write_txn because _record_task_failure opens its
+        # own. Manual reclaim_task is operator-driven and stays uncounted.
+        if cur.rowcount == 1:
+            _record_task_failure(
+                conn, row["id"],
+                error=f"stale_lock={row['claim_lock']}",
+                outcome="reclaimed",
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "heartbeat_stale": bool(heartbeat_stale),
+                },
+            )
     return reclaimed
 
 
@@ -8975,14 +8996,15 @@ def detect_stale_running(
             }
             payload.update(termination)
 
+            error = (
+                f"no heartbeat for {int(hb_age)}s "
+                if hb_age is not None
+                else "no heartbeat ever"
+            ) + f" after {int(elapsed)}s running"
             run_id = _end_run(
                 conn, tid,
                 outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
+                error=error,
                 metadata=payload,
             )
             _append_event(
@@ -8990,15 +9012,31 @@ def detect_stale_running(
             )
             reclaimed.append(tid)
 
-        # Intentionally NOT calling _record_task_failure here. Stale reclaim
-        # is dispatcher-side detection of an absent heartbeat; the task is
-        # going straight back to ``ready`` for re-dispatch. Counting it as
-        # a worker failure would let two legitimately-long-running tasks
-        # (>4h without explicit heartbeat) trip the circuit breaker and
-        # auto-block, even though no worker actually failed. The 'stale'
-        # event already lives in task_events for auditability; that's the
-        # right surface for "this happened" without conflating with the
-        # spawn_failed / timed_out / crashed counters.
+        # Count the reclaim against the unified failure counter so repeated
+        # no-heartbeat stale reclaims trip the circuit breaker (HEL-3135).
+        # Previously this path requeued to `ready` without touching
+        # consecutive_failures, which let a single stuck card re-dispatch
+        # dozens of times (production incident: t_8cea8385 ×65). Long-running
+        # legitimate work should heartbeat; the heartbeat mandate is the
+        # protection against false trips, not skipping the counter. Pattern
+        # matches enforce_max_runtime: call outside write_txn because
+        # _record_task_failure opens its own; on trip it flips ready→blocked
+        # and emits `gave_up` on top of the `stale` event already recorded.
+        if cur.rowcount == 1:
+            _record_task_failure(
+                conn, tid,
+                error=error,
+                outcome="stale",
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={
+                    "elapsed_seconds": int(elapsed),
+                    "heartbeat_age_seconds": (
+                        int(hb_age) if hb_age is not None else None
+                    ),
+                    "pid": int(pid) if pid else None,
+                },
+            )
 
     return reclaimed
 
@@ -9417,8 +9455,8 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
-    """Record a non-success outcome (spawn_failed / crashed / timed_out)
-    and maybe trip the circuit breaker.
+    """Record a non-success outcome (spawn_failed / crashed / timed_out /
+    reclaimed / stale) and maybe trip the circuit breaker.
 
     Unified replacement for the old spawn-only ``_record_spawn_failure``.
     Every path that ends a task with a non-success outcome funnels
