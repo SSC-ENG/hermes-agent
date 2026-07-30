@@ -512,18 +512,19 @@ def test_dispatch_missing_profile_emits_durable_failure_event(kanban_home, monke
     assert result.skipped_nonspawnable == [task_id]
     assert not result.spawned
     failure = events[-1]
-    assert failure.kind == "dispatch_nonspawnable_assignee"
+    assert failure.kind == "pre_dispatch_validation_failed"
     assert failure.payload is not None
     assert failure.payload == {
-        "outcome": "dispatch_failed",
+        "outcome": "dispatch_rejected",
         "error_code": "missing_assignee_profile",
         "error": (
             "Assignee profile 'ghost' does not exist; create that Hermes "
-            "profile or reassign the task to an installed profile."
+            "profile or reassign the task."
         ),
         "assignee": "ghost",
         "task_status": "ready",
         "action": "create_profile_or_reassign",
+        "requirement": "ghost",
     }
     assert len(repeated_events) == len(events)
 
@@ -543,7 +544,7 @@ def test_dispatch_missing_review_profile_emits_failure_event(kanban_home, monkey
         failure = kb.list_events(conn, task_id)[-1]
 
     assert result.skipped_nonspawnable == [task_id]
-    assert failure.kind == "dispatch_nonspawnable_assignee"
+    assert failure.kind == "pre_dispatch_validation_failed"
     assert failure.payload is not None
     assert failure.payload["task_status"] == "review"
     assert failure.payload["error_code"] == "missing_assignee_profile"
@@ -581,7 +582,7 @@ def test_dispatch_missing_profile_reassignment_resets_event_dedup(
         kb.dispatch_once(conn)
         failures = [
             event for event in kb.list_events(conn, task_id)
-            if event.kind == "dispatch_nonspawnable_assignee"
+            if event.kind == "pre_dispatch_validation_failed"
         ]
 
     assert len(failures) == 2
