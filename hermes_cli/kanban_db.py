@@ -3347,7 +3347,14 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
+                "last_failure_error = NULL, "
+                "status = CASE "
+                "WHEN status = 'blocked' AND block_kind = 'capability' "
+                "THEN 'ready' ELSE status END, "
+                "block_kind = CASE "
+                "WHEN status = 'blocked' AND block_kind = 'capability' "
+                "THEN NULL ELSE block_kind END "
+                "WHERE id = ?",
                 (profile, task_id),
             )
         else:
@@ -4027,7 +4034,19 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            preflight_event = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? "
+                "AND kind IN ('pre_dispatch_validation_failed', 'unblocked') "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            preflight_blocked = bool(
+                preflight_event
+                and preflight_event["kind"] == "pre_dispatch_validation_failed"
+            )
+            if cur_status == "blocked" and (
+                _has_sticky_block(conn, task_id) or preflight_blocked
+            ):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
@@ -6663,6 +6682,10 @@ class DispatchResult:
     installed Hermes profile. Each real (non-dry-run) skip also emits a
     deduplicated ``dispatch_nonspawnable_assignee`` event so the failure is
     durable and machine-readable instead of silently leaving work queued."""
+    pre_dispatch_failed: list[tuple[str, str]] = field(default_factory=list)
+    """Task ids rejected by the pre-claim capability gate, paired with the
+    stable failure code. A rejected task is blocked before a run is created
+    and is not retried until an operator changes the task or node state."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -8242,6 +8265,70 @@ def _dispatch_once_locked(
                 },
             )
 
+    def reject_pre_dispatch(task: Task, failure: Any) -> None:
+        """Block one invalid candidate before claim and emit one durable event."""
+        result.pre_dispatch_failed.append((task.id, failure.code))
+        if dry_run:
+            return
+        with write_txn(conn):
+            latest = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "AND kind IN ('pre_dispatch_validation_failed', 'assigned', 'unblocked') "
+                "ORDER BY id DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            if latest is not None and latest["kind"] == "pre_dispatch_validation_failed":
+                try:
+                    prior = json.loads(latest["payload"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    prior = {}
+                if prior.get("error_code") == failure.code:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                        "last_failure_error = ? WHERE id = ? AND status IN ('ready', 'review')",
+                        (failure.message[:500], task.id),
+                    )
+                    return
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "last_failure_error = ? WHERE id = ? AND status IN ('ready', 'review')",
+                (failure.message[:500], task.id),
+            )
+            payload = {
+                "outcome": "dispatch_rejected",
+                "error_code": failure.code,
+                "error": failure.message,
+                "action": failure.action,
+                "assignee": task.assignee,
+                "task_status": task.status,
+            }
+            if failure.requirement:
+                payload["requirement"] = failure.requirement
+            _append_event(
+                conn,
+                task.id,
+                "pre_dispatch_validation_failed",
+                payload,
+            )
+
+    def validate_pre_dispatch(task: Task) -> bool:
+        from hermes_cli.kanban_preflight import validate_dispatch_candidate
+
+        board_slug = board if board else get_current_board()
+        failure = validate_dispatch_candidate(
+            task,
+            runtime_argv=_resolve_hermes_argv(),
+            board_default_workdir=(
+                read_board_metadata(board_slug).get("default_workdir") or None
+            ),
+            scratch_root=workspaces_root(board=board),
+        )
+        if failure is None:
+            return True
+        reject_pre_dispatch(task, failure)
+        return False
+
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
@@ -8376,7 +8463,25 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
             result.skipped_nonspawnable.append(row["id"])
-            record_nonspawnable(row["id"], row_assignee, "ready")
+            candidate = get_task(conn, row["id"])
+            if candidate is not None:
+                from hermes_cli.kanban_preflight import PreDispatchFailure
+
+                reject_pre_dispatch(
+                    candidate,
+                    PreDispatchFailure(
+                        code="missing_assignee_profile",
+                        message=(
+                            f"Assignee profile {row_assignee!r} does not exist; "
+                            "create that Hermes profile or reassign the task."
+                        ),
+                        action="create_profile_or_reassign",
+                        requirement=row_assignee,
+                    ),
+                )
+            continue
+        candidate = get_task(conn, row["id"])
+        if candidate is None or not validate_pre_dispatch(candidate):
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -8511,7 +8616,25 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
-            record_nonspawnable(row["id"], row["assignee"], "review")
+            candidate = get_task(conn, row["id"])
+            if candidate is not None:
+                from hermes_cli.kanban_preflight import PreDispatchFailure
+
+                reject_pre_dispatch(
+                    candidate,
+                    PreDispatchFailure(
+                        code="missing_assignee_profile",
+                        message=(
+                            f"Assignee profile {row['assignee']!r} does not exist; "
+                            "create that Hermes profile or reassign the task."
+                        ),
+                        action="create_profile_or_reassign",
+                        requirement=row["assignee"],
+                    ),
+                )
+            continue
+        candidate = get_task(conn, row["id"])
+        if candidate is None or not validate_pre_dispatch(candidate):
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
