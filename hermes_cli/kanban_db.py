@@ -6537,6 +6537,7 @@ def create_governed_intake_task(
     title: str,
     body: str,
     tenant: str,
+    content_digest: str,
     idempotency_key: str,
     created_by: Optional[str] = None,
     priority: int = 0,
@@ -6548,17 +6549,33 @@ def create_governed_intake_task(
     deliveries may race. Serialize the lookup+insert under one write transaction
     without changing the compatibility behavior of the general task API.
     """
+    if not content_digest or not content_digest.strip():
+        raise ValueError("governed intake requires a content_digest")
     if not idempotency_key or not idempotency_key.strip():
         raise ValueError("governed intake requires an idempotency_key")
+    content_digest = content_digest.strip()
+    idempotency_key = idempotency_key.strip()
     now = int(time.time())
     with write_txn(conn):
         existing = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key.strip(),),
+            (idempotency_key,),
         ).fetchone()
         if existing:
+            existing_task = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?", (existing["id"],)
+            ).fetchone()
+            if existing_task is None or content_digest not in (existing_task["body"] or ""):
+                raise ValueError("idempotency_key is already used for different intake content")
             return existing["id"], False
+        digest_match = conn.execute(
+            "SELECT id FROM tasks WHERE body LIKE ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (f"%{content_digest}%",),
+        ).fetchone()
+        if digest_match:
+            return digest_match["id"], False
         task_id = _new_task_id()
         conn.execute(
             "INSERT INTO tasks "
@@ -6573,7 +6590,7 @@ def create_governed_intake_task(
                 int(priority),
                 now,
                 created_by,
-                idempotency_key.strip(),
+                idempotency_key,
             ),
         )
         _append_event(

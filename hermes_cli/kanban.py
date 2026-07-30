@@ -1533,6 +1533,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 title=args.title,
                 body=args.body,
                 tenant=intake_envelope.tenant_domain,
+                content_digest=intake_envelope.content_digest,
                 idempotency_key=intake_envelope.idempotency_key,
                 created_by=args.created_by or _profile_author(),
                 priority=args.priority,

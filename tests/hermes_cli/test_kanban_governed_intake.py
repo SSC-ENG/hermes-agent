@@ -52,6 +52,7 @@ def test_governed_intake_create_is_idempotent(kanban_home):
             title="raw intake",
             body=render_envelope(envelope),
             tenant=envelope.tenant_domain,
+            content_digest=envelope.content_digest,
             idempotency_key=envelope.idempotency_key,
             created_by="haa",
         )
@@ -60,12 +61,49 @@ def test_governed_intake_create_is_idempotent(kanban_home):
             title="raw intake",
             body=render_envelope(envelope),
             tenant=envelope.tenant_domain,
+            content_digest=envelope.content_digest,
             idempotency_key=envelope.idempotency_key,
             created_by="haa",
         )
         count = conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
             (envelope.idempotency_key,),
+        ).fetchone()[0]
+    assert first[0] == second[0]
+    assert first[1] is True
+    assert second[1] is False
+    assert count == 1
+
+
+def test_governed_intake_deduplicates_same_digest_with_different_key(kanban_home):
+    envelope = build_envelope(
+        source="webhook:inbox",
+        items=["same content"],
+        tenant_domain="engineering",
+        idempotency_key="producer-key-1",
+    )
+    with kb.connect_closing() as conn:
+        first = kb.create_governed_intake_task(
+            conn,
+            title="raw intake",
+            body=render_envelope(envelope),
+            tenant=envelope.tenant_domain,
+            content_digest=envelope.content_digest,
+            idempotency_key=envelope.idempotency_key,
+            created_by="haa",
+        )
+        second = kb.create_governed_intake_task(
+            conn,
+            title="raw intake",
+            body=render_envelope(envelope),
+            tenant=envelope.tenant_domain,
+            content_digest=envelope.content_digest,
+            idempotency_key="producer-key-2",
+            created_by="haa",
+        )
+        count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status != 'archived' AND body LIKE ?",
+            (f"%{envelope.content_digest}%",),
         ).fetchone()[0]
     assert first[0] == second[0]
     assert first[1] is True
