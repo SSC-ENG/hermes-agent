@@ -53,7 +53,7 @@ dispatcher used to claim their task — even under unusual symlink or
 Docker layouts.
 
 Schema is intentionally small: tasks, task_links, task_comments,
-task_events.  The ``workspace_kind`` field decouples coordination from git
+task_events, and the finding-to-queue ledger. The ``workspace_kind`` field decouples coordination from git
 worktrees so that research / ops / digital-twin workloads work alongside
 coding workloads.  See ``docs/hermes-kanban-v1-spec.pdf`` for the full
 design specification.
@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -124,6 +125,23 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+FINDING_DISPOSITIONS = frozenset({
+    "accepted_queued",
+    "accepted_existing",
+    "rejected",
+    "deferred",
+    "not_applicable",
+})
+ACCEPTED_FINDING_DISPOSITIONS = frozenset({
+    "accepted_queued",
+    "accepted_existing",
+})
+FINDING_EVENT_TYPES = frozenset({
+    "finding_opened",
+    "finding_dispositioned",
+    "finding_queued",
+    "finding_verified",
+})
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1130,6 +1148,26 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class Finding:
+    finding_key: str
+    work_intent_id: str
+    source_system: str
+    source_ref: str
+    title: str
+    owner_id: str
+    disposition: Optional[str]
+    linear_issue_id: Optional[str]
+    decision_record_ref: Optional[str]
+    opened_at: int
+    dispositioned_at: Optional[int]
+    verified_at: Optional[int]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Finding":
+        return cls(**{field.name: row[field.name] for field in dataclasses.fields(cls)})
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1275,6 +1313,41 @@ CREATE TABLE IF NOT EXISTS telemetry_review_findings (
     report_json       TEXT NOT NULL
 );
 
+-- Queryable disposition gate for accepted TRC/readout findings. This remains
+-- in the existing Kanban database and event stream rather than creating a
+-- second telemetry store. A finding is an orphan until a valid disposition is
+-- both recorded and verified against its queue or decision evidence.
+CREATE TABLE IF NOT EXISTS findings (
+    finding_key         TEXT PRIMARY KEY,
+    work_intent_id      TEXT NOT NULL REFERENCES tasks(id),
+    source_system       TEXT NOT NULL CHECK (source_system IN ('trc', 'readout')),
+    source_ref          TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    owner_id            TEXT NOT NULL,
+    disposition         TEXT CHECK (disposition IN (
+        'accepted_queued', 'accepted_existing', 'rejected', 'deferred',
+        'not_applicable'
+    )),
+    linear_issue_id     TEXT,
+    decision_record_ref TEXT,
+    opened_at           INTEGER NOT NULL,
+    dispositioned_at    INTEGER,
+    verified_at         INTEGER,
+    CHECK (
+        disposition IS NULL
+        OR (
+            disposition IN ('accepted_queued', 'accepted_existing')
+            AND linear_issue_id IS NOT NULL
+            AND decision_record_ref IS NULL
+        )
+        OR (
+            disposition IN ('rejected', 'deferred', 'not_applicable')
+            AND linear_issue_id IS NULL
+            AND decision_record_ref IS NOT NULL
+        )
+    )
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1347,6 +1420,8 @@ CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_created        ON task_events(created_at, id);
+CREATE INDEX IF NOT EXISTS idx_findings_intent        ON findings(work_intent_id, opened_at);
+CREATE INDEX IF NOT EXISTS idx_findings_disposition   ON findings(disposition, verified_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_review_runs_boundary  ON telemetry_review_runs(board_slug, window_end);
@@ -4136,6 +4211,297 @@ def _append_work_intent_event(
     # legacy heartbeat kind for one source mutation.
     storage_kind = "work_intent_heartbeat" if event_type == "heartbeat" else event_type
     _append_event(conn, task_id, storage_kind, payload, run_id=run_id)
+
+
+_FINDING_POLICY_VERSION = "HEL-3112-v1"
+
+
+def _validate_finding_ref(value: str, *, field_name: str) -> str:
+    """Return a minimized durable reference and reject local filesystem paths."""
+    ref = (value or "").strip()
+    if not ref:
+        raise ValueError(f"{field_name} is required")
+    if ref.startswith(("/", "file://")) or re.match(r"^[A-Za-z]:[\\/]", ref):
+        raise ValueError(f"{field_name} must not be a local absolute path")
+    return ref
+
+
+def get_finding(conn: sqlite3.Connection, finding_key: str) -> Optional[Finding]:
+    row = conn.execute(
+        "SELECT * FROM findings WHERE finding_key = ?", (finding_key.strip(),)
+    ).fetchone()
+    return Finding.from_row(row) if row else None
+
+
+def list_findings(conn: sqlite3.Connection) -> list[Finding]:
+    rows = conn.execute(
+        "SELECT * FROM findings ORDER BY opened_at ASC, finding_key ASC"
+    ).fetchall()
+    return [Finding.from_row(row) for row in rows]
+
+
+def list_orphan_findings(conn: sqlite3.Connection) -> list[Finding]:
+    """Return accepted findings that have not completed the queue gate."""
+    rows = conn.execute(
+        """
+        SELECT *
+          FROM findings
+         WHERE disposition IS NULL
+            OR verified_at IS NULL
+            OR (
+                disposition IN ('accepted_queued', 'accepted_existing')
+                AND linear_issue_id IS NULL
+            )
+            OR (
+                disposition IN ('rejected', 'deferred', 'not_applicable')
+                AND decision_record_ref IS NULL
+            )
+         ORDER BY opened_at ASC, finding_key ASC
+        """
+    ).fetchall()
+    return [Finding.from_row(row) for row in rows]
+
+
+def _append_finding_event(
+    conn: sqlite3.Connection,
+    finding: Finding,
+    event_type: str,
+    *,
+    actor_id: str,
+    from_state: str,
+    to_state: str,
+    reason_code: str,
+) -> None:
+    if event_type not in FINDING_EVENT_TYPES:
+        raise ValueError(f"unsupported finding event type: {event_type}")
+    now = time.time()
+    source_event_id = f"finding:{finding.finding_key}:{event_type}"
+    payload = {
+        "event_id": f"evt_{secrets.token_hex(16)}",
+        "occurred_at": _utc_source_time(now),
+        "recorded_at": _utc_source_time(now),
+        "event_type": event_type,
+        "source_system": "kanban",
+        "source_event_id": source_event_id,
+        "work_intent_id": finding.work_intent_id,
+        "task_id": finding.work_intent_id,
+        "run_id": None,
+        "session_id": None,
+        "linear_issue_id": finding.linear_issue_id,
+        "repo": None,
+        "pr_number": None,
+        "head_sha": None,
+        "deployment_id": None,
+        "environment": None,
+        "deployed_sha": None,
+        "actor_type": "profile",
+        "actor_id": actor_id,
+        "node_id": _claimer_id().split(":", 1)[0],
+        "from_state": from_state,
+        "to_state": to_state,
+        "reason_code": reason_code,
+        "causation_event_id": None,
+        "idempotency_key": f"finding:{finding.finding_key}:{event_type}",
+        "evidence_ref": f"finding:{finding.finding_key}",
+        "policy_version": _FINDING_POLICY_VERSION,
+        "schema_version": 1,
+        "finding_key": finding.finding_key,
+        "finding_source_system": finding.source_system,
+        "finding_source_ref": finding.source_ref,
+        "disposition": finding.disposition,
+        "decision_record_ref": finding.decision_record_ref,
+    }
+    _append_event(
+        conn,
+        finding.work_intent_id,
+        event_type,
+        payload,
+        run_id=None,
+    )
+
+
+def open_finding(
+    conn: sqlite3.Connection,
+    *,
+    finding_key: str,
+    work_intent_id: str,
+    source_system: str,
+    source_ref: str,
+    title: str,
+    owner_id: str,
+    actor_id: str,
+) -> Finding:
+    """Open one accepted TRC/readout finding, replay-safe by stable key."""
+    key = (finding_key or "").strip()
+    intent = (work_intent_id or "").strip()
+    source = (source_system or "").strip().lower()
+    finding_title = (title or "").strip()
+    owner = (owner_id or "").strip()
+    actor = (actor_id or "").strip()
+    ref = _validate_finding_ref(source_ref, field_name="source_ref")
+    if not key:
+        raise ValueError("finding_key is required")
+    if source not in {"trc", "readout"}:
+        raise ValueError("source_system must be 'trc' or 'readout'")
+    if not finding_title or not owner or not actor:
+        raise ValueError("title, owner_id, and actor_id are required")
+    if get_task(conn, intent) is None:
+        raise ValueError(f"unknown work_intent_id: {intent}")
+
+    with write_txn(conn):
+        existing = get_finding(conn, key)
+        if existing:
+            expected = (
+                intent, source, ref, finding_title, owner,
+            )
+            actual = (
+                existing.work_intent_id,
+                existing.source_system,
+                existing.source_ref,
+                existing.title,
+                existing.owner_id,
+            )
+            if actual != expected:
+                raise ValueError(
+                    f"finding {key!r} already exists with different evidence"
+                )
+            return existing
+        conn.execute(
+            """
+            INSERT INTO findings (
+                finding_key, work_intent_id, source_system, source_ref,
+                title, owner_id, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (key, intent, source, ref, finding_title, owner, int(time.time())),
+        )
+        finding = get_finding(conn, key)
+        assert finding is not None
+        _append_finding_event(
+            conn,
+            finding,
+            "finding_opened",
+            actor_id=actor,
+            from_state="UNKNOWN",
+            to_state="opened",
+            reason_code="accepted_review_finding",
+        )
+        return finding
+
+
+def disposition_finding(
+    conn: sqlite3.Connection,
+    *,
+    finding_key: str,
+    disposition: str,
+    actor_id: str,
+    linear_issue_id: Optional[str] = None,
+    decision_record_ref: Optional[str] = None,
+) -> Finding:
+    """Record the finding's one immutable queue/decision disposition."""
+    key = (finding_key or "").strip()
+    value = (disposition or "").strip()
+    actor = (actor_id or "").strip()
+    linear_id = (linear_issue_id or "").strip() or None
+    decision_ref = (decision_record_ref or "").strip() or None
+    if value not in FINDING_DISPOSITIONS:
+        raise ValueError(f"unsupported disposition: {value!r}")
+    if not actor:
+        raise ValueError("actor_id is required")
+    if value in ACCEPTED_FINDING_DISPOSITIONS:
+        if not linear_id:
+            raise ValueError(f"{value} requires linear_issue_id")
+        if decision_ref:
+            raise ValueError(f"{value} cannot carry decision_record_ref")
+    else:
+        if not decision_ref:
+            raise ValueError(f"{value} requires decision_record_ref")
+        decision_ref = _validate_finding_ref(
+            decision_ref, field_name="decision_record_ref"
+        )
+        if linear_id:
+            raise ValueError(f"{value} cannot carry linear_issue_id")
+
+    with write_txn(conn):
+        existing = get_finding(conn, key)
+        if existing is None:
+            raise ValueError(f"unknown finding_key: {key}")
+        if existing.disposition is not None:
+            if (
+                existing.disposition == value
+                and existing.linear_issue_id == linear_id
+                and existing.decision_record_ref == decision_ref
+            ):
+                return existing
+            raise ValueError(f"finding {key!r} already has disposition")
+        conn.execute(
+            """
+            UPDATE findings
+               SET disposition = ?, linear_issue_id = ?,
+                   decision_record_ref = ?, dispositioned_at = ?
+             WHERE finding_key = ? AND disposition IS NULL
+            """,
+            (value, linear_id, decision_ref, int(time.time()), key),
+        )
+        finding = get_finding(conn, key)
+        assert finding is not None
+        _append_finding_event(
+            conn,
+            finding,
+            "finding_dispositioned",
+            actor_id=actor,
+            from_state="opened",
+            to_state=value,
+            reason_code=value,
+        )
+        if value in ACCEPTED_FINDING_DISPOSITIONS:
+            _append_finding_event(
+                conn,
+                finding,
+                "finding_queued",
+                actor_id=actor,
+                from_state=value,
+                to_state="queued",
+                reason_code=value,
+            )
+        return finding
+
+
+def verify_finding(
+    conn: sqlite3.Connection,
+    finding_key: str,
+    *,
+    actor_id: str,
+) -> Finding:
+    """Close the gate after PPMA verifies the queue or decision evidence."""
+    key = (finding_key or "").strip()
+    actor = (actor_id or "").strip()
+    if not actor:
+        raise ValueError("actor_id is required")
+    with write_txn(conn):
+        existing = get_finding(conn, key)
+        if existing is None:
+            raise ValueError(f"unknown finding_key: {key}")
+        if existing.disposition is None:
+            raise ValueError(f"finding {key!r} has no disposition")
+        if existing.verified_at is not None:
+            return existing
+        conn.execute(
+            "UPDATE findings SET verified_at = ? WHERE finding_key = ?",
+            (int(time.time()), key),
+        )
+        finding = get_finding(conn, key)
+        assert finding is not None
+        _append_finding_event(
+            conn,
+            finding,
+            "finding_verified",
+            actor_id=actor,
+            from_state=finding.disposition or "UNKNOWN",
+            to_state="verified",
+            reason_code="queue_evidence_verified",
+        )
+        return finding
 
 
 def _end_run(
