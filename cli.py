@@ -17730,19 +17730,29 @@ def main(
         # unwinds the main thread; the worker thread keeps running, the
         # process gets reparented to init, and the dispatcher's _pid_alive
         # check returns True forever — task stuck in 'running' indefinitely.
-        # Skip the controlled-unwind dance and call os._exit(0) so the kernel
-        # reclaims the PID immediately and detect_crashed_workers can reclaim
-        # the stale claim on the next tick. Flush logging + stdout/stderr
+        # Skip the controlled-unwind dance and call os._exit(128+signum) so
+        # the kernel reclaims the PID immediately and detect_crashed_workers
+        # can reclaim the claim on the next tick *as a signaled/nonzero exit*,
+        # not as a clean-exit protocol_violation. Flush logging + stdout/stderr
         # first so the final debug trace isn't lost; SIGALRM deadman guards
         # the flush against any rare blocking-I/O case (the reporter measured
         # flush in <1ms; the alarm is a failsafe, not the common path).
         if os.environ.get("HERMES_KANBAN_TASK"):
+            # Exit 128+signum (143 for SIGTERM) so the dispatcher can
+            # distinguish a forced kill from a genuine clean exit. The
+            # previous os._exit(0) collapsed both cases into
+            # protocol_violation. 143 is bash's conventional SIGTERM code.
+            _forced_rc = 128 + int(signum) if isinstance(signum, int) and signum > 0 else 143
             try:
                 import signal as _sig_mod
                 if hasattr(_sig_mod, "SIGALRM"):
                     # Cancel any pre-existing alarm to avoid colliding with
-                    # caller-installed timers.
-                    _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
+                    # caller-installed timers. Alarm still force-exits via
+                    # the same distinguishable code so a wedged flush cannot
+                    # leave the PID stuck (and still cannot look clean).
+                    _sig_mod.signal(
+                        _sig_mod.SIGALRM, lambda *_: os._exit(_forced_rc)
+                    )
                     _sig_mod.alarm(2)
             except Exception:
                 pass
@@ -17756,7 +17766,7 @@ def main(
                     _stream.flush()
                 except Exception:
                     pass
-            os._exit(0)
+            os._exit(_forced_rc)
         raise KeyboardInterrupt()
     try:
         import signal as _signal
@@ -17990,7 +18000,17 @@ def main(
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
-                cli.chat(query, images=single_query_images or None)
+                # Capture chat's return so single-query mode can exit non-zero
+                # when init / credentials / run fails. chat() returns None on
+                # those paths (empty string is still a valid successful answer).
+                # Previously this branch fell through to a clean return →
+                # process rc=0, so "Failed to initialize agent… Goodbye!" was
+                # reaped as clean-exit *protocol_violation* after one
+                # dispatch_interval_seconds tick (~60s). Live evidence:
+                # t_fe90ab52 crash loop (50×, median 60s).
+                _chat_response = cli.chat(
+                    query, images=single_query_images or None
+                )
                 cli._print_exit_summary(clear_screen=False)
                 # Kanban workers (default spawn is `chat -q`, not `-Q`)
                 # must not exit rc=0 after a terminal conversation-loop
@@ -18002,6 +18022,8 @@ def main(
                 )
                 if _q_loop_exit is not None:
                     sys.exit(_q_loop_exit)
+                if _chat_response is None:
+                    sys.exit(1)
         finally:
             _finalize_single_query(cli)
         return

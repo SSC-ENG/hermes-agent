@@ -288,6 +288,14 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Exit status a kanban worker uses when a forced shut-down signal arrives
+# (SIGTERM from the dispatcher reclaim/max-runtime path, or any external
+# kill). Bash convention is ``128 + signum`` (143 for SIGTERM). The worker
+# CLI deliberately exits with this code from ``_signal_handler_q`` so the
+# reaper can classify the exit as a forced kill rather than a clean
+# ``protocol_violation`` (rc=0 with no terminal kanban tool call).
+KANBAN_FORCED_SIGNAL_EXIT_BASE = 128
+
 # Exit code a kanban worker uses when the conversation loop ends in a terminal
 # (non-success) state — truncation give-up, partial stream exhaustion, or an
 # unrecoverable loop error — and the worker either:
@@ -8467,12 +8475,11 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
-    * ``"terminal_loop_error"`` — ``WIFEXITED`` with status
-      ``KANBAN_TERMINAL_LOOP_EXIT_CODE``. The worker's conversation loop
-      ended without completion (truncation give-up, etc.). Prefer that the
-      worker already wrote a ``kanban_block`` before exiting; if the task
-      is still ``running`` this is still a hard failure (auto-block) but the
-      error text names the *loop error*, not a bare protocol violation.
+    * ``"forced_signal"`` — ``WIFEXITED`` with status in the shell signal
+      range ``128 + N`` (e.g. 143 = SIGTERM). The kanban worker's SIGTERM
+      handler intentionally exits this way so a reclaim / max-runtime kill
+      is distinguishable from a genuine clean exit. Mapped as a signaled
+      crash (not a protocol violation).
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -8480,7 +8487,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``terminal_loop_error`` / ``nonzero_exit``) or the signal number (for
+    ``nonzero_exit`` / ``forced_signal``) or the signal number (for
     ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
@@ -8494,8 +8501,14 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
-            if code == KANBAN_TERMINAL_LOOP_EXIT_CODE:
-                return ("terminal_loop_error", code)
+            # Shell/bash convention: 128 + signum. Worker SIGTERM handler
+            # exits 143 so we never mislabel a forced kill as clean.
+            if (
+                KANBAN_FORCED_SIGNAL_EXIT_BASE
+                < code
+                <= KANBAN_FORCED_SIGNAL_EXIT_BASE + 64
+            ):
+                return ("forced_signal", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -9266,6 +9279,26 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
+                elif kind == "forced_signal":
+                    # rc = 128+signum (e.g. 143 = bash SIGTERM). Worker was
+                    # force-killed (reclaim, max_runtime, external SIGTERM) and
+                    # deliberately reported a non-zero status so we do NOT
+                    # count it as a clean-exit protocol_violation.
+                    sig = (
+                        int(code) - KANBAN_FORCED_SIGNAL_EXIT_BASE
+                        if code is not None else None
+                    )
+                    if sig == 15:
+                        error_text = (
+                            f"pid {pid} force-killed (SIGTERM, exit {code}) "
+                            f"— not a protocol violation"
+                        )
+                    else:
+                        error_text = (
+                            f"pid {pid} force-killed "
+                            f"(signal {sig}, exit {code}) "
+                            f"— not a protocol violation"
+                        )
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
@@ -9273,6 +9306,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+                    if kind == "forced_signal":
+                        event_payload["forced_kill"] = True
+                        event_payload["signal"] = (
+                            int(code) - KANBAN_FORCED_SIGNAL_EXIT_BASE
+                        )
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "

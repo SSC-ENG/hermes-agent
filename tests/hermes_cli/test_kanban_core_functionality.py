@@ -1408,3 +1408,94 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         conn.close()
 
 
+
+
+def _drive_forced_signal_exit(conn, tid, fake_pid, exit_code=143):
+    """One forced-kill (shell 128+signum) reaper pass for ``tid``.
+
+    os.W_EXITCODE(status=exit_code, signal=0) packs a normal exit with the
+    given status on POSIX. 143 is bash's SIGTERM convention.
+    """
+    raw = int(exit_code) << 8
+    return _drive_worker_exit(conn, tid, fake_pid, raw)
+
+
+def test_forced_sigterm_exit_is_not_protocol_violation(kanban_home):
+    """rc=143 (shell SIGTERM) must NOT be classified as protocol_violation.
+
+    Regression for the ~60s clean-exit crash loop: workers killed mid-run
+    via SIGTERM used to call ``os._exit(0)``, so the dispatcher recorded a
+    protocol_violation. After the fix they exit 143 and the reaper must
+    treat that as a forced kill / nonzero crash — retryable, not a
+    violation-budget consumer.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="forced-sigterm", assignee="worker")
+        crashed = _drive_forced_signal_exit(conn, tid, 880001, exit_code=143)
+        assert tid in crashed
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", task.status
+        assert task.consecutive_failures >= 1
+
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "protocol_violation" not in kinds, kinds
+        assert "crashed" in kinds
+
+        crash_ev = [e for e in events if e.kind == "crashed"][-1]
+        payload = crash_ev.payload or {}
+        assert payload.get("exit_kind") == "forced_signal"
+        assert payload.get("exit_code") == 143
+        assert payload.get("forced_kill") is True
+        assert payload.get("signal") == 15
+        err = task.last_failure_error or ""
+        assert "without calling kanban_complete" not in err
+        assert "force-killed" in err
+    finally:
+        conn.close()
+
+
+def test_clean_exit_zero_still_protocol_violation(kanban_home):
+    """rc=0 with no terminal tool remains a protocol_violation.
+
+    Pins the timeout-vs-clean-exit distinction: only genuine clean exits
+    (exit status 0) trip the violation path. Forced kills (143) and plain
+    nonzero exits do not.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="clean-zero", assignee="worker")
+        crashed = _drive_protocol_violation(conn, tid, 880002)
+        assert tid in crashed
+
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "protocol_violation" in kinds, kinds
+
+        task = kb.get_task(conn, tid)
+        assert "protocol violation" in (task.last_failure_error or "")
+    finally:
+        conn.close()
+
+
+def test_classify_worker_exit_forced_signal_vs_clean():
+    """Unit-level pin of ``_classify_worker_exit`` kinds."""
+    import hermes_cli.kanban_db as _kb
+
+    _kb._record_worker_exit(770001, 0)  # clean exit status 0
+    _kb._record_worker_exit(770002, 143 << 8)  # exited 143
+    _kb._record_worker_exit(770003, 1 << 8)  # exited 1
+    _kb._record_worker_exit(770004, _kb.KANBAN_RATE_LIMIT_EXIT_CODE << 8)
+
+    assert _kb._classify_worker_exit(770001) == ("clean_exit", 0)
+    assert _kb._classify_worker_exit(770002) == ("forced_signal", 143)
+    assert _kb._classify_worker_exit(770003) == ("nonzero_exit", 1)
+    assert _kb._classify_worker_exit(770004) == (
+        "rate_limited",
+        _kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+    assert _kb._classify_worker_exit(999999) == ("unknown", None)
