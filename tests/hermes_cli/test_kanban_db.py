@@ -3569,6 +3569,63 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     conn.close()
 
 
+def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplog):
+    """kanban_db.connect() must stay usable when WAL silently no-ops to DELETE."""
+    import sqlite3 as _sqlite3
+    from unittest.mock import patch as _patch
+
+    import hermes_state
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    hermes_state._wal_fallback_warned_paths.clear()
+    # Assume a fixed SQLite so the WAL-reset gate doesn't short-circuit.
+    monkeypatch.setattr(
+        hermes_state, "is_sqlite_wal_reset_vulnerable",
+        lambda version_info=None: False,
+    )
+
+    real_connect = _sqlite3.connect
+
+    class _WalSilentNoOpConnection(_sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+            if "journal_mode=wal" in sql.lower().replace(" ", ""):
+                return super().execute("PRAGMA journal_mode=delete", *args, **kwargs)
+            return super().execute(sql, *args, **kwargs)
+
+    def wal_silent_noop_connect(*args, **kwargs):
+        kwargs.pop("factory", None)
+        return real_connect(
+            *args, factory=_WalSilentNoOpConnection, **kwargs
+        )
+
+    with _patch(
+        "hermes_cli.kanban_db.sqlite3.connect",
+        side_effect=wal_silent_noop_connect,
+    ):
+        with caplog.at_level("ERROR", logger="hermes_state"):
+            conn = kb.connect()
+
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+    t = kb.create_task(conn, title="post-silent-fallback task")
+    tasks = kb.list_tasks(conn)
+    assert any(row.id == t for row in tasks)
+    conn.close()
+
+    errors = [
+        r
+        for r in caplog.records
+        if r.levelname == "ERROR" and "kanban.db" in r.getMessage()
+    ]
+    assert len(errors) >= 1, (
+        f"Expected a kanban.db ERROR, got: {[r.getMessage() for r in caplog.records]}"
+    )
+
+
 def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     """Regression test for issue #22459.
 
@@ -4311,7 +4368,7 @@ def test_dispatch_review_does_not_claim_ready_tasks(
         claimed = kb.claim_review_task(conn, t)
     assert claimed is None
 
-# Stale detection — detect_stale_running
+# Stale detection — detect_stale_running + HEL-3135 failure-counter wiring
 # ---------------------------------------------------------------------------
 
 def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkeypatch):
@@ -4495,66 +4552,235 @@ def test_detect_stale_skips_blocked_tasks(kanban_home, monkeypatch):
         assert kb.get_task(conn, t).status == "blocked"
 
 
-def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
-    """Stale reclaim must NOT tick consecutive_failures.
+# NOTE: test_detect_stale_does_not_tick_failure_counter (this PR's original
+# assertion that stale reclaim must NEVER tick consecutive_failures) is
+# superseded by fork/main's HEL-3135 fix below. Production incident
+# t_8cea8385 showed the opposite failure mode — a single stuck no-heartbeat
+# card re-dispatching 65 times because the counter never ticked. main's
+# detect_stale_running now calls _record_task_failure on every no-heartbeat
+# reclaim so repeated stale reclaims trip the same circuit breaker as
+# crashed/timed_out (see test_detect_stale_running_repeated_reclaims_trip_failure_limit
+# below), while a single reclaim still resets on a subsequent clean complete
+# (test_single_stale_reclaim_then_success_resets_failure_counter). The merged
+# hermes_cli/kanban_db.py already carries main's detect_stale_running
+# unmodified (auto-merged, no conflict) — this test file edit only aligns
+# the test suite with that already-resolved production behavior.
+def _prepare_expired_claim(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    pid: int,
+    claimer_suffix: str = "w",
+) -> str:
+    """Claim a task, attach a dead worker PID, and expire its claim TTL."""
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    kb.claim_task(conn, tid, claimer=f"{host}:{claimer_suffix}")
+    kb._set_worker_pid(conn, tid, pid)
+    conn.execute(
+        "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+        (int(time.time()) - 3600, int(time.time()) - 1800, tid),
+    )
+    conn.commit()
+    return tid
 
-    Stale detection is dispatcher-side absence-of-heartbeat detection,
-    not a worker failure. Counting it as a failure would let two
-    legitimately-long-running tasks (>4h without explicit heartbeat) trip
-    the circuit breaker and auto-block at the default failure_limit=2,
-    even though no worker actually failed. The 'stale' event in
-    task_events is the right audit surface; the consecutive_failures
-    counter is reserved for spawn_failed / timed_out / crashed.
+
+def _prepare_stale_heartbeat_run(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    pid: int,
+    claimer_suffix: str = "w",
+) -> str:
+    """Claim a long-running task with a stale last_heartbeat_at and no TTL role."""
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    kb.claim_task(conn, tid, claimer=f"{host}:{claimer_suffix}")
+    old_started = int(time.time()) - (5 * 3600)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, started_at = ?, "
+            "last_heartbeat_at = ? WHERE id = ?",
+            (pid, old_started, int(time.time()) - (2 * 3600), tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (old_started, tid),
+        )
+    return tid
+
+
+def test_release_stale_claims_repeated_reclaims_trip_failure_limit(
+    kanban_home, monkeypatch,
+):
+    """HEL-3135: N claim-TTL stale reclaims trip the same circuit breaker.
+
+    release_stale_claims used to requeue ready without touching
+    consecutive_failures, so a stuck card could loop forever. Repeated
+    outdated-TTL reclaims must now count like crashed/timed_out and emit
+    ``gave_up`` once the effective failure_limit is reached.
     """
     import hermes_cli.kanban_db as _kb
 
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    limit = kb.DEFAULT_FAILURE_LIMIT
+
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="stale-no-counter-tick", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, os.getpid())
+        tid = None
+        for i in range(limit):
+            # Each reclaim closes the run and returns the task to ready
+            # (or blocked on the final tick). Re-claim to open the next
+            # attempt the way the dispatcher would.
+            if tid is None:
+                tid = _prepare_expired_claim(
+                    conn, title="ttl-storm", pid=61000 + i, claimer_suffix=f"w{i}",
+                )
+            else:
+                host = _kb._claimer_id().split(":", 1)[0]
+                assert kb.claim_task(conn, tid, claimer=f"{host}:w{i}") is not None
+                kb._set_worker_pid(conn, tid, 61000 + i)
+                conn.execute(
+                    "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+                    "WHERE id = ?",
+                    (int(time.time()) - 3600, int(time.time()) - 1800, tid),
+                )
+                conn.commit()
 
-        five_hours_ago = int(time.time()) - (5 * 3600)
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
+            n = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+            assert n == 1, f"reclaim tick {i + 1}: expected 1 reclaimed, got {n}"
+            task = kb.get_task(conn, tid)
+            if i + 1 < limit:
+                assert task.status == "ready", (
+                    f"reclaim tick {i + 1}: below limit must stay ready, "
+                    f"got {task.status}"
+                )
+                assert task.consecutive_failures == i + 1
+            else:
+                assert task.status == "blocked", (
+                    f"reclaim tick {i + 1}: at limit must auto-block, "
+                    f"got {task.status}"
+                )
+                assert task.consecutive_failures == limit
+
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload.get("trigger_outcome") == "reclaimed"
+        assert payload.get("failures") == limit
+        reclaimed_events = [
+            e for e in kb.list_events(conn, tid) if e.kind == "reclaimed"
+        ]
+        assert len(reclaimed_events) == limit
+
+
+def test_detect_stale_running_repeated_reclaims_trip_failure_limit(
+    kanban_home, monkeypatch,
+):
+    """HEL-3135: N no-heartbeat stale reclaims trip the circuit breaker.
+
+    detect_stale_running previously ended runs with outcome='stale' and
+    intentionally skipped _record_task_failure (see removed comment at the
+    production incident site). That is the exact bypass that let
+    t_8cea8385 re-dispatch 65 times. Counter + gave_up must now match
+    enforce_max_runtime.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda *_a, **_k: {
+            "prev_pid": 99999,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        },
+    )
+    monkeypatch.setattr(_kb, "_worker_survived_termination", lambda _t: False)
+
+    limit = kb.DEFAULT_FAILURE_LIMIT
+    stale_timeout = 4 * 3600
+
+    with kb.connect() as conn:
+        tid = None
+        for i in range(limit):
+            if tid is None:
+                tid = _prepare_stale_heartbeat_run(
+                    conn, title="stale-storm", pid=62000 + i, claimer_suffix=f"s{i}",
+                )
+            else:
+                host = _kb._claimer_id().split(":", 1)[0]
+                assert kb.claim_task(conn, tid, claimer=f"{host}:s{i}") is not None
+                old_started = int(time.time()) - (5 * 3600)
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET worker_pid = ?, started_at = ?, "
+                        "last_heartbeat_at = ? WHERE id = ?",
+                        (
+                            62000 + i,
+                            old_started,
+                            int(time.time()) - (2 * 3600),
+                            tid,
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE task_runs SET started_at = ? "
+                        "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                        (old_started, tid),
+                    )
+
+            out = kb.detect_stale_running(
+                conn, stale_timeout_seconds=stale_timeout, signal_fn=lambda _p, _s: None,
             )
-            conn.execute(
-                "UPDATE task_runs SET started_at = ? "
-                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                (five_hours_ago, t),
-            )
-            # Counter starts at 0; assert that's our baseline.
-            row = conn.execute(
-                "SELECT consecutive_failures FROM tasks WHERE id = ?", (t,)
-            ).fetchone()
-            assert row["consecutive_failures"] in (0, None)
+            assert out == [tid], f"stale tick {i + 1}: expected [{tid}], got {out}"
+            task = kb.get_task(conn, tid)
+            if i + 1 < limit:
+                assert task.status == "ready"
+                assert task.consecutive_failures == i + 1
+            else:
+                assert task.status == "blocked"
+                assert task.consecutive_failures == limit
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-        stale = kb.detect_stale_running(
-            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
-        )
-        assert t in stale, "Task should be reclaimed by stale detection"
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload.get("trigger_outcome") == "stale"
+        assert payload.get("failures") == limit
+        stale_events = [e for e in kb.list_events(conn, tid) if e.kind == "stale"]
+        assert len(stale_events) == limit
 
-        # Critical assertion: the failure counter MUST NOT have ticked.
-        # Stale reclaim resets to ready for re-dispatch without penalty.
-        row = conn.execute(
-            "SELECT consecutive_failures FROM tasks WHERE id = ?", (t,)
-        ).fetchone()
-        assert row["consecutive_failures"] in (0, None), (
-            f"Stale reclaim ticked consecutive_failures to "
-            f"{row['consecutive_failures']!r}; should remain 0/NULL."
-        )
 
-        # And the audit trail still records the stale event so operators
-        # can see what happened.
-        events = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
-            (t,),
-        ).fetchall()
-        kinds = [e["kind"] for e in events]
-        assert "stale" in kinds, (
-            f"Expected 'stale' event in task_events; got {kinds!r}"
-        )
+def test_single_stale_reclaim_then_success_resets_failure_counter(
+    kanban_home, monkeypatch,
+):
+    """One stale reclaim below the limit still leaves success recoverable.
+
+    No-regression: a task that reclaims once, is reclaimed to ready with
+    consecutive_failures=1, then completes cleanly must reset the counter
+    (existing complete_task behavior) and must not stay blocked.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        tid = _prepare_expired_claim(conn, title="reclaim-once", pid=63001)
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+        assert not any(e.kind == "gave_up" for e in kb.list_events(conn, tid))
+
+        # Re-claim and complete cleanly — counter must reset.
+        host = _kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:ok") is not None
+        assert kb.complete_task(conn, tid, summary="done after one reclaim")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert task.consecutive_failures == 0
 
 
 # ---------------------------------------------------------------------------

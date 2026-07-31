@@ -538,10 +538,14 @@ DEFAULT_CONFIG = {
                                       # floored at 0.75 (raise-only) so compaction
                                       # doesn't fire with half the window still free;
                                       # set this above 0.75 to override the floor.
-        "threshold_tokens": None,     # absolute token cap — when set, compression
-                                      # triggers at the lower of the ratio-based
-                                      # threshold and this token count. Clamped to
-                                      # the model's context length at apply-time.
+        "threshold_tokens": 100_000,  # absolute token cap (first-fires-wins vs ratio).
+                                      # Required on large-window models (e.g. 1M
+                                      # Claude): ratio-only 50% never fires until
+                                      # 500K tokens, but real long sessions peak
+                                      # ~100–200K and pay 2× input permanently.
+                                      # Set null/0 to disable the absolute cap and
+                                      # use ratio-only. Clamped to the model's
+                                      # context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
@@ -2205,6 +2209,22 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Versioned thresholds for the 48h telemetry-hole rule set
+        # (RULE_SET_VERSION). Defaults match the TRC design §6 operating
+        # baselines; tune from observed distributions after review cycles.
+        # Not hidden constants — override under kanban.telemetry_hole_rules.
+        "telemetry_hole_rules": {
+            "protocol_violation_repeat_threshold": 2,
+            "retry_thrash_failure_threshold": 2,
+            "blocked_aged_medium_seconds": 12 * 60 * 60,
+            "blocked_aged_high_seconds": 24 * 60 * 60,
+            "blocked_aged_critical_seconds": 48 * 60 * 60,
+            # When unset-or-null, falls back to kanban.dispatch_interval_seconds.
+            "dispatch_tick_seconds": None,
+            # When unset-or-null, defaults to 2 * dispatch_tick_seconds.
+            "todo_promotable_threshold_seconds": None,
+            "ready_unclaimed_threshold_seconds": None,
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

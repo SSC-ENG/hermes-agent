@@ -1,13 +1,21 @@
 """Fail-closed capability validation for Kanban dispatch candidates.
 
-The dispatcher calls this module before claiming a task. Validation is read-only:
-it inspects the assignee profile, required skill packages, credentials, runtime,
-workspace configuration, and skill-declared node boundaries without creating a
-run, workspace, or subprocess.
+The dispatcher calls this module before claiming a task. Validation does not
+create a run, workspace, or subprocess. It inspects the assignee profile,
+required skill packages, credentials, runtime, workspace configuration, and
+skill-declared node boundaries.
+
+Before rejecting a missing/hollow/unreadable certification (or task-scoped)
+skill, :func:`validate_dispatch_candidate` best-effort repairs the assignee's
+profile skill tree from a known-good canonical package under the Hermes root
+``skills/`` tree (and ``HERMES_CANONICAL_SKILLS`` when set). Repairs never invent
+policy for unknown certifications, never overwrite a present package that only
+fails platform eligibility, and still fail closed when no golden source exists.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import socket
@@ -15,7 +23,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from agent.skill_utils import parse_frontmatter, skill_matches_platform_list
+from agent.skill_utils import (
+    is_excluded_skill_path,
+    parse_frontmatter,
+    skill_matches_platform_list,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -26,6 +40,17 @@ class PreDispatchFailure:
     message: str
     action: str
     requirement: Optional[str] = None
+
+
+# Failure codes that a best-effort golden-copy sync may repair. Platform and
+# node eligibility are routing issues — never overwritten by fleet-wide content.
+_REPAIRABLE_SKILL_CODES = frozenset(
+    {
+        "missing_required_skill",
+        "hollow_required_skill",
+        "unreadable_required_skill",
+    }
+)
 
 
 def _string_list(value: Any) -> list[str]:
@@ -47,6 +72,8 @@ def _profile_skill_files(profile_dir: Path) -> dict[str, Path]:
     try:
         candidates = root.rglob("SKILL.md")
         for skill_file in candidates:
+            if is_excluded_skill_path(skill_file, root=root):
+                continue
             try:
                 raw = skill_file.read_text(encoding="utf-8")
                 frontmatter, _ = parse_frontmatter(raw)
@@ -61,7 +88,91 @@ def _profile_skill_files(profile_dir: Path) -> dict[str, Path]:
     return indexed
 
 
-def _skill_failure(skill_name: str, skill_file: Optional[Path]) -> Optional[PreDispatchFailure]:
+def _index_skill_tree(skills_root: Path) -> dict[str, Path]:
+    """Index SKILL.md packages under *skills_root* by dirname and frontmatter name."""
+    if not skills_root.is_dir():
+        return {}
+    indexed: dict[str, Path] = {}
+    try:
+        for skill_file in skills_root.rglob("SKILL.md"):
+            if is_excluded_skill_path(skill_file, root=skills_root):
+                continue
+            try:
+                raw = skill_file.read_text(encoding="utf-8")
+                frontmatter, _ = parse_frontmatter(raw)
+            except (OSError, UnicodeError):
+                frontmatter = {}
+            package_dir = skill_file.parent
+            indexed.setdefault(package_dir.name, package_dir)
+            declared = str(frontmatter.get("name") or "").strip()
+            if declared:
+                indexed.setdefault(declared, package_dir)
+    except OSError:
+        return indexed
+    return indexed
+
+
+def _canonical_skills_roots(hermes_root: Optional[Path] = None) -> list[Path]:
+    """Ordered roots that may hold golden certification skill packages.
+
+    1. ``HERMES_CANONICAL_SKILLS`` (explicit override; may be os.pathsep-joined)
+    2. ``<hermes_root>/skills`` — fleet shared tree (HELIOs wrappers, SSC certs
+       when operators place them under e.g. ``skills/ssc-certs/`` or
+       ``skills/engineering/``)
+    """
+    roots: list[Path] = []
+    override = os.environ.get("HERMES_CANONICAL_SKILLS", "").strip()
+    if override:
+        for piece in override.split(os.pathsep):
+            piece = piece.strip()
+            if piece:
+                roots.append(Path(piece).expanduser())
+    if hermes_root is None:
+        try:
+            from hermes_constants import get_default_hermes_root
+
+            hermes_root = get_default_hermes_root()
+        except Exception:
+            hermes_root = Path.home() / ".hermes"
+    roots.append(Path(hermes_root or (Path.home() / ".hermes")) / "skills")
+    # De-dupe while preserving order.
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
+def find_canonical_skill_package(
+    skill_name: str,
+    *,
+    hermes_root: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the package directory of a known-good golden skill, or ``None``.
+
+    Lookup is by package directory name or frontmatter ``name``. Callers must
+    treat ``None`` as fail-closed — no self-invented policy for unknown certs.
+    """
+    name = str(skill_name or "").strip()
+    if not name:
+        return None
+    for root in _canonical_skills_roots(hermes_root):
+        indexed = _index_skill_tree(root)
+        package = indexed.get(name)
+        if package is not None and (package / "SKILL.md").is_file():
+            return package
+    return None
+
+
+def _skill_content_failure(
+    skill_name: str,
+    skill_file: Optional[Path],
+) -> Optional[PreDispatchFailure]:
+    """Return missing/unreadable/hollow failures only (not platform/node)."""
     if skill_file is None:
         return PreDispatchFailure(
             code="missing_required_skill",
@@ -71,7 +182,7 @@ def _skill_failure(skill_name: str, skill_file: Optional[Path]) -> Optional[PreD
         )
     try:
         raw = skill_file.read_text(encoding="utf-8")
-        frontmatter, body = parse_frontmatter(raw)
+        _frontmatter, body = parse_frontmatter(raw)
     except (OSError, UnicodeError):
         return PreDispatchFailure(
             code="unreadable_required_skill",
@@ -92,6 +203,25 @@ def _skill_failure(skill_name: str, skill_file: Optional[Path]) -> Optional[PreD
             action="restore_required_skill_content",
             requirement=skill_name,
         )
+    return None
+
+
+def _skill_failure(skill_name: str, skill_file: Optional[Path]) -> Optional[PreDispatchFailure]:
+    content_failure = _skill_content_failure(skill_name, skill_file)
+    if content_failure is not None:
+        return content_failure
+    assert skill_file is not None
+    try:
+        raw = skill_file.read_text(encoding="utf-8")
+        frontmatter, _body = parse_frontmatter(raw)
+    except (OSError, UnicodeError):
+        # Already classified by _skill_content_failure; keep diagnostic path safe.
+        return PreDispatchFailure(
+            code="unreadable_required_skill",
+            message=f"Required skill package {skill_name!r} cannot be read.",
+            action="repair_required_skill_package",
+            requirement=skill_name,
+        )
     if not skill_matches_platform_list(frontmatter.get("platforms")):
         return PreDispatchFailure(
             code="wrong_node_platform",
@@ -100,6 +230,105 @@ def _skill_failure(skill_name: str, skill_file: Optional[Path]) -> Optional[PreD
             requirement=skill_name,
         )
     return None
+
+
+def _install_skill_package(source_package: Path, dest_package: Path) -> None:
+    """Copy *source_package* onto *dest_package* via a sibling staging dir."""
+    dest_package.parent.mkdir(parents=True, exist_ok=True)
+    staging = dest_package.parent / f".{dest_package.name}.skill-sync-tmp"
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        shutil.copytree(source_package, staging)
+        if dest_package.exists():
+            shutil.rmtree(dest_package)
+        staging.replace(dest_package)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _destination_for_canonical(
+    profile_dir: Path,
+    skill_name: str,
+    source_package: Path,
+    hermes_root: Optional[Path],
+) -> Path:
+    """Preserve category-relative path under the profile skills tree when known."""
+    skills_dest_root = profile_dir / "skills"
+    for root in _canonical_skills_roots(hermes_root):
+        try:
+            rel = source_package.resolve().relative_to(root.resolve())
+        except (OSError, ValueError):
+            continue
+        return skills_dest_root / rel
+    # Fallback: install by skill name at the skills root.
+    return skills_dest_root / skill_name
+
+
+def sync_required_skills(
+    profile_dir: Path,
+    skill_names: Sequence[str],
+    *,
+    skills_index: Optional[Mapping[str, Path]] = None,
+    hermes_root: Optional[Path] = None,
+) -> list[str]:
+    """Best-effort install/repair of required skill packages from golden copies.
+
+    Only repairs missing, hollow, or unreadable packages when a canonical source
+    exists under the shared Hermes skills tree (or ``HERMES_CANONICAL_SKILLS``).
+    Returns the skill names successfully repaired. Does not invent unknown certs
+    and does not overwrite a present package that fails only on platform/node.
+    """
+    index = dict(skills_index) if skills_index is not None else _profile_skill_files(profile_dir)
+    repaired: list[str] = []
+    for raw_name in skill_names:
+        skill_name = str(raw_name or "").strip()
+        if not skill_name:
+            continue
+        skill_file = index.get(skill_name)
+        failure = _skill_failure(skill_name, skill_file)
+        if failure is None:
+            continue
+        if failure.code not in _REPAIRABLE_SKILL_CODES:
+            # Present-but-wrong-platform (or other non-content failure): leave
+            # the package untouched so routing policy is preserved.
+            continue
+        source_package = find_canonical_skill_package(skill_name, hermes_root=hermes_root)
+        if source_package is None:
+            continue
+        # Golden content must itself be substantive before we install it.
+        golden_skill = source_package / "SKILL.md"
+        if _skill_content_failure(skill_name, golden_skill if golden_skill.is_file() else None):
+            continue
+        if skill_file is not None:
+            dest_package = skill_file.parent
+        else:
+            dest_package = _destination_for_canonical(
+                profile_dir, skill_name, source_package, hermes_root,
+            )
+        try:
+            _install_skill_package(source_package, dest_package)
+        except OSError as exc:
+            logger.warning(
+                "pre_dispatch skill-sync failed for %s → %s: %s",
+                skill_name,
+                dest_package,
+                exc,
+            )
+            continue
+        installed = dest_package / "SKILL.md"
+        if _skill_content_failure(skill_name, installed if installed.is_file() else None):
+            logger.warning(
+                "pre_dispatch skill-sync left %s non-substantive at %s",
+                skill_name,
+                dest_package,
+            )
+            continue
+        index[skill_name] = installed
+        index.setdefault(dest_package.name, installed)
+        repaired.append(skill_name)
+    return repaired
 
 
 def _binding_certifications(profile_dir: Path) -> list[str]:
@@ -344,8 +573,14 @@ def validate_dispatch_candidate(
     board_default_workdir: Optional[str],
     scratch_root: Path,
     env: Optional[Mapping[str, str]] = None,
+    hermes_root: Optional[Path] = None,
 ) -> Optional[PreDispatchFailure]:
-    """Return the first actionable failure, or ``None`` when dispatch is safe."""
+    """Return the first actionable failure, or ``None`` when dispatch is safe.
+
+    Before rejecting missing/hollow/unreadable required skills, best-effort
+    repairs them from the fleet canonical skills tree when a golden package
+    exists. Unknown certifications without a golden source still fail closed.
+    """
     from hermes_cli.profiles import get_profile_dir, profile_exists
 
     assignee = str(task.assignee or "").strip()
@@ -374,6 +609,18 @@ def validate_dispatch_candidate(
         *certifications,
         *(str(name).strip() for name in (task.skills or []) if str(name).strip()),
     ]))
+    # Best-effort self-heal for known-good golden certification/skill packages
+    # before applying fail-closed checks. Does not invent policy for unknown
+    # certs and never overwrites wrong-platform packages.
+    if required_skills:
+        repaired = sync_required_skills(
+            profile_dir,
+            required_skills,
+            skills_index=skills,
+            hermes_root=hermes_root,
+        )
+        if repaired:
+            skills = _profile_skill_files(profile_dir)
     available_env = _available_env_names(profile_dir, env or os.environ)
     for skill_name in required_skills:
         skill_file = skills.get(skill_name)

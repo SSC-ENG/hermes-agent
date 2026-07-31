@@ -4608,6 +4608,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # don't auto-queue another continuation on top of a user-cancelled
         # turn (which would make Ctrl+C feel like it did nothing).
         self._last_turn_interrupted = False
+        # Last run_conversation result from chat(); the single-query (-q)
+        # kanban worker path reads this after chat() returns to auto-block
+        # on terminal loop errors (truncation give-up / completed=False).
+        self._last_run_conversation_result = None
         self._should_exit = False
         # /exit --delete: when True, the current session's SQLite history and
         # on-disk transcripts are deleted during shutdown. Set by
@@ -13660,6 +13664,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
                     )
+                    # Stash for single-query (-q) kanban workers so main() can
+                    # auto-block on terminal loop errors after chat() returns
+                    # (workers spawn with chat -q, not always -Q).
+                    self._last_run_conversation_result = result
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -13679,6 +13687,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         "failed": True,
                         "error": _summary,
                     }
+                    self._last_run_conversation_result = result
                 finally:
                     if _one_turn_model_restore:
                         self._restore_model_runtime_snapshot(_one_turn_model_restore)
@@ -17333,6 +17342,63 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+def _finalize_kanban_terminal_loop_if_needed(result) -> Optional[int]:
+    """If this process is a kanban worker whose conversation loop ended
+    without completion, auto-block the card and return a non-zero exit code.
+
+    Acceptance for t_8165e956 / truncation give-up: never exit rc=0 with no
+    board write when the loop returns completed=False/partial=True. Either
+    the board is transitioned (kind=transient, loop error as reason) or the
+    process exits non-zero so the dispatcher records a terminal-loop error
+    instead of a bare protocol_violation.
+
+    Returns:
+        None when this is not a kanban worker terminal-loop case (caller
+        keeps its existing exit-code logic).
+        int exit code when the worker must exit for a terminal loop error
+        (typically KANBAN_TERMINAL_LOOP_EXIT_CODE).
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id or not isinstance(result, dict):
+        return None
+    try:
+        from hermes_cli.kanban_db import (
+            KANBAN_TERMINAL_LOOP_EXIT_CODE,
+            finalize_kanban_worker_terminal_loop_error,
+            format_terminal_loop_error,
+            is_terminal_conversation_loop_result,
+        )
+    except Exception:
+        # Worst case: fall through to non-zero exit so reap never sees rc=0.
+        if result.get("partial") or (
+            result.get("completed") is False and result.get("error")
+        ) or (result.get("failed") and result.get("error")):
+            if result.get("failure_reason") in ("rate_limit", "billing"):
+                return None
+            if result.get("interrupted"):
+                return None
+            return 1
+        return None
+
+    if not is_terminal_conversation_loop_result(result):
+        return None
+
+    status = finalize_kanban_worker_terminal_loop_error(
+        task_id, result=result, kind="transient",
+    )
+    reason = status.get("reason") or format_terminal_loop_error(result)
+    print(f"Kanban terminal loop error: {reason}", file=sys.stderr)
+    if status.get("error") and not status.get("acted"):
+        print(
+            f"Kanban auto-block failed: {status['error']}",
+            file=sys.stderr,
+        )
+    # Always non-zero so a failed board write cannot look like a clean
+    # protocol-violation rc=0. When the block did land, 76 still gives
+    # reap a distinct signal from bare crashes (rc=1) and rate-limits (75).
+    return int(KANBAN_TERMINAL_LOOP_EXIT_CODE)
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -17676,19 +17742,29 @@ def main(
         # unwinds the main thread; the worker thread keeps running, the
         # process gets reparented to init, and the dispatcher's _pid_alive
         # check returns True forever — task stuck in 'running' indefinitely.
-        # Skip the controlled-unwind dance and call os._exit(0) so the kernel
-        # reclaims the PID immediately and detect_crashed_workers can reclaim
-        # the stale claim on the next tick. Flush logging + stdout/stderr
+        # Skip the controlled-unwind dance and call os._exit(128+signum) so
+        # the kernel reclaims the PID immediately and detect_crashed_workers
+        # can reclaim the claim on the next tick *as a signaled/nonzero exit*,
+        # not as a clean-exit protocol_violation. Flush logging + stdout/stderr
         # first so the final debug trace isn't lost; SIGALRM deadman guards
         # the flush against any rare blocking-I/O case (the reporter measured
         # flush in <1ms; the alarm is a failsafe, not the common path).
         if os.environ.get("HERMES_KANBAN_TASK"):
+            # Exit 128+signum (143 for SIGTERM) so the dispatcher can
+            # distinguish a forced kill from a genuine clean exit. The
+            # previous os._exit(0) collapsed both cases into
+            # protocol_violation. 143 is bash's conventional SIGTERM code.
+            _forced_rc = 128 + int(signum) if isinstance(signum, int) and signum > 0 else 143
             try:
                 import signal as _sig_mod
                 if hasattr(_sig_mod, "SIGALRM"):
                     # Cancel any pre-existing alarm to avoid colliding with
-                    # caller-installed timers.
-                    _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
+                    # caller-installed timers. Alarm still force-exits via
+                    # the same distinguishable code so a wedged flush cannot
+                    # leave the PID stuck (and still cannot look clean).
+                    _sig_mod.signal(
+                        _sig_mod.SIGALRM, lambda *_: os._exit(_forced_rc)
+                    )
                     _sig_mod.alarm(2)
             except Exception:
                 pass
@@ -17702,7 +17778,7 @@ def main(
                     _stream.flush()
                 except Exception:
                     pass
-            os._exit(0)
+            os._exit(_forced_rc)
         raise KeyboardInterrupt()
     try:
         import signal as _signal
@@ -17885,16 +17961,20 @@ def main(
 
                         # Ensure proper exit code for automation wrappers.
                         #
-                        # Kanban workers get a special case: when the run failed
-                        # purely because the provider rate-limited / exhausted
-                        # quota (not because the task itself is broken), exit with
-                        # the EX_TEMPFAIL sentinel instead of the generic 1. The
-                        # dispatcher's reap classifier maps that code to a
-                        # ``rate_limited`` exit and releases the task back to
-                        # ``ready`` WITHOUT incrementing the failure counter, so a
-                        # 5-hour quota window can't trip the circuit breaker and
-                        # permanently block the card. Non-kanban runs keep the
-                        # plain 0/1 contract automation wrappers expect.
+                        # Kanban workers get special cases:
+                        # 1. Terminal conversation-loop error (truncation
+                        #    give-up, partial=True, completed=False+error):
+                        #    auto-block the card (kind=transient) and exit
+                        #    KANBAN_TERMINAL_LOOP_EXIT_CODE. Never rc=0 —
+                        #    that was the t_8165e956 burn loop (dispatcher
+                        #    saw clean exit with no lifecycle write).
+                        # 2. Provider rate-limit / billing: exit EX_TEMPFAIL
+                        #    so the dispatcher releases without tripping
+                        #    the circuit breaker.
+                        # Non-kanban runs keep the plain 0/1 contract.
+                        _loop_exit = _finalize_kanban_terminal_loop_if_needed(result)
+                        if _loop_exit is not None:
+                            sys.exit(_loop_exit)
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
@@ -17932,8 +18012,30 @@ def main(
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
-                cli.chat(query, images=single_query_images or None)
+                # Capture chat's return so single-query mode can exit non-zero
+                # when init / credentials / run fails. chat() returns None on
+                # those paths (empty string is still a valid successful answer).
+                # Previously this branch fell through to a clean return →
+                # process rc=0, so "Failed to initialize agent… Goodbye!" was
+                # reaped as clean-exit *protocol_violation* after one
+                # dispatch_interval_seconds tick (~60s). Live evidence:
+                # t_fe90ab52 crash loop (50×, median 60s).
+                _chat_response = cli.chat(
+                    query, images=single_query_images or None
+                )
                 cli._print_exit_summary(clear_screen=False)
+                # Kanban workers (default spawn is `chat -q`, not `-Q`)
+                # must not exit rc=0 after a terminal conversation-loop
+                # error — that was the t_8165e956 burn loop. Use the
+                # stashed run_conversation result to auto-block + exit
+                # non-zero. No-ops when HERMES_KANBAN_TASK is unset.
+                _q_loop_exit = _finalize_kanban_terminal_loop_if_needed(
+                    getattr(cli, "_last_run_conversation_result", None)
+                )
+                if _q_loop_exit is not None:
+                    sys.exit(_q_loop_exit)
+                if _chat_response is None:
+                    sys.exit(1)
         finally:
             _finalize_single_query(cli)
         return

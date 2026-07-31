@@ -53,7 +53,7 @@ dispatcher used to claim their task — even under unusual symlink or
 Docker layouts.
 
 Schema is intentionally small: tasks, task_links, task_comments,
-task_events.  The ``workspace_kind`` field decouples coordination from git
+task_events, and the finding-to-queue ledger. The ``workspace_kind`` field decouples coordination from git
 worktrees so that research / ops / digital-twin workloads work alongside
 coding workloads.  See ``docs/hermes-kanban-v1-spec.pdf`` for the full
 design specification.
@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -124,6 +125,35 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+FINDING_DISPOSITIONS = frozenset({
+    "accepted_queued",
+    "accepted_existing",
+    "rejected",
+    "deferred",
+    "not_applicable",
+})
+ACCEPTED_FINDING_DISPOSITIONS = frozenset({
+    "accepted_queued",
+    "accepted_existing",
+})
+FINDING_EVENT_TYPES = frozenset({
+    "finding_opened",
+    "finding_dispositioned",
+    "finding_queued",
+    "finding_verified",
+    "finding_rehomed",
+})
+# Governed verification adapters. ``verify_finding`` only accepts a typed
+# ``VerifiedEvidence`` produced by one of these adapters; free-form strings
+# are structure, not behavioral proof, and are rejected.
+FINDING_VERIFICATION_SOURCES = frozenset({
+    "linear_graphql",
+    "decision_record",
+})
+# Container work-intent used to rehome durable telemetry finding evidence
+# whose originating task no longer exists (legacy rows predating the
+# promotion trigger, or rows recovered from a partially-purged board).
+FINDING_RESCUE_TASK_ID = "t_finding_rescue"
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -257,6 +287,200 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+# Exit status a kanban worker uses when a forced shut-down signal arrives
+# (SIGTERM from the dispatcher reclaim/max-runtime path, or any external
+# kill). Bash convention is ``128 + signum`` (143 for SIGTERM). The worker
+# CLI deliberately exits with this code from ``_signal_handler_q`` so the
+# reaper can classify the exit as a forced kill rather than a clean
+# ``protocol_violation`` (rc=0 with no terminal kanban tool call).
+KANBAN_FORCED_SIGNAL_EXIT_BASE = 128
+
+# Exit code a kanban worker uses when the conversation loop ends in a terminal
+# (non-success) state — truncation give-up, partial stream exhaustion, or an
+# unrecoverable loop error — and the worker either:
+#   * auto-blocked the card (kind=transient) with the loop error as reason, or
+#   * failed to write a board transition and is signalling that to the
+#     dispatcher via a non-zero exit so reap never records a bare
+#     protocol_violation (clean rc=0 with no lifecycle tool).
+# 76 is adjacent to EX_TEMPFAIL (75) and unused elsewhere in the worker.
+KANBAN_TERMINAL_LOOP_EXIT_CODE = 76
+
+# Prefix stamped into run.error / task.last_failure_error when the worker
+# (not the dispatcher) reported a terminal conversation-loop error. Lets
+# BEL triage distinguish "model never called lifecycle tools" from
+# "loop gave up mid-stream and the worker wrote the failure" without
+# grepping session logs.
+KANBAN_TERMINAL_LOOP_ERROR_PREFIX = "terminal loop error: "
+
+
+def is_terminal_conversation_loop_result(result: Optional[dict]) -> bool:
+    """True when a run_conversation result is a terminal non-success loop end.
+
+    Covers truncation give-up (``partial=True`` / ``completed=False`` +
+    error), bare ``failed`` results with an error string, and other
+    completed=False/partial endings. Interruptions and rate-limit/billing
+    failures are excluded — those have their own lifecycle contracts.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("interrupted"):
+        return False
+    # Provider throttle / billing are handled via KANBAN_RATE_LIMIT_EXIT_CODE.
+    if result.get("failure_reason") in ("rate_limit", "billing"):
+        return False
+    if result.get("completed") is True:
+        return False
+    if result.get("partial"):
+        return True
+    if result.get("failed") and result.get("error"):
+        return True
+    # completed=False with an explicit error (truncation give-up shape, etc.).
+    if result.get("completed") is False and result.get("error"):
+        return True
+    return False
+
+
+def format_terminal_loop_error(result: Optional[dict]) -> str:
+    """Build the human/operator-facing loop-error reason string."""
+    if not isinstance(result, dict):
+        return f"{KANBAN_TERMINAL_LOOP_ERROR_PREFIX}unknown conversation-loop failure"
+    err = (
+        result.get("error")
+        or result.get("final_response")
+        or result.get("turn_exit_reason")
+        or "conversation loop ended without completion"
+    )
+    err = str(err).strip() or "conversation loop ended without completion"
+    # Avoid double-prefixing if a caller already stamped it.
+    if err.startswith(KANBAN_TERMINAL_LOOP_ERROR_PREFIX):
+        return err
+    return f"{KANBAN_TERMINAL_LOOP_ERROR_PREFIX}{err}"
+
+
+def finalize_kanban_worker_terminal_loop_error(
+    task_id: Optional[str] = None,
+    *,
+    result: Optional[dict] = None,
+    error: Optional[str] = None,
+    kind: str = "transient",
+    expected_run_id: Optional[int] = None,
+) -> dict:
+    """Auto-block a kanban worker task after a terminal conversation-loop error.
+
+    Returns a status dict::
+
+        {
+          "acted": bool,          # True when this call transitioned the task
+          "status": str | None,   # post-call task status when known
+          "reason": str,          # reason written / that would be written
+          "error": str | None,    # helper failure detail, else None
+        }
+
+    Safe to call when *task_id* is missing or the task is already terminal —
+    those are no-ops with ``acted=False``. Never raises.
+    """
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    reason = (error or "").strip() or format_terminal_loop_error(result)
+    out: dict = {
+        "acted": False,
+        "status": None,
+        "reason": reason,
+        "error": None,
+    }
+    if not tid:
+        out["error"] = "no HERMES_KANBAN_TASK"
+        return out
+    if kind is not None and kind not in VALID_BLOCK_KINDS:
+        out["error"] = f"invalid block kind {kind!r}"
+        return out
+    if expected_run_id is None:
+        raw_run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        if raw_run:
+            try:
+                expected_run_id = int(raw_run)
+            except ValueError:
+                expected_run_id = None
+    try:
+        conn = connect()
+    except Exception as exc:  # pragma: no cover - env isolation
+        out["error"] = f"connect failed: {exc}"
+        return out
+    try:
+        task = get_task(conn, tid)
+        if task is None:
+            out["error"] = f"unknown task {tid}"
+            return out
+        out["status"] = task.status
+        if task.status not in ("running", "ready"):
+            # Already terminal (blocked/done/etc). Treat as success so the
+            # worker can exit without a bare protocol_violation ghost.
+            return out
+        meta = {
+            "source": "worker_terminal_loop_error",
+            "loop_error": reason,
+            "partial": bool(result.get("partial")) if isinstance(result, dict) else None,
+            "failed": bool(result.get("failed")) if isinstance(result, dict) else None,
+            "turn_exit_reason": (
+                result.get("turn_exit_reason") if isinstance(result, dict) else None
+            ),
+        }
+        ok = block_task(
+            conn,
+            tid,
+            reason=reason,
+            kind=kind,
+            expected_run_id=expected_run_id,
+        )
+        if not ok:
+            out["error"] = (
+                f"block_task refused for {tid} "
+                f"(status={task.status!r}, expected_run_id={expected_run_id!r})"
+            )
+            return out
+        # Annotate the just-ended run so BEL triage sees a loop error, not a
+        # bare protocol_violation. block_task ends the run without metadata.
+        try:
+            run = latest_run(conn, tid)
+            if run is not None:
+                with write_txn(conn):
+                    conn.execute(
+                        """
+                        UPDATE task_runs
+                           SET error    = COALESCE(error, ?),
+                               metadata = ?
+                         WHERE id = ?
+                        """,
+                        (
+                            reason[:1000],
+                            json.dumps(meta, ensure_ascii=False),
+                            int(run.id),
+                        ),
+                    )
+        except Exception as exc:
+            # Transition already landed; metadata is best-effort.
+            _log.debug(
+                "finalize_kanban_worker_terminal_loop_error: metadata update failed: %s",
+                exc,
+            )
+        landed = get_task(conn, tid)
+        out["acted"] = True
+        out["status"] = landed.status if landed else "blocked"
+        return out
+    except Exception as exc:
+        _log.warning(
+            "finalize_kanban_worker_terminal_loop_error failed for %s: %s",
+            tid,
+            exc,
+            exc_info=True,
+        )
+        out["error"] = str(exc)
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -1163,6 +1387,47 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class Finding:
+    finding_key: str
+    work_intent_id: str
+    source_system: str
+    source_ref: str
+    title: str
+    owner_id: str
+    disposition: Optional[str]
+    linear_issue_id: Optional[str]
+    decision_record_ref: Optional[str]
+    opened_at: int
+    dispositioned_at: Optional[int]
+    verified_at: Optional[int]
+    verification_evidence_ref: Optional[str]
+    verification_source: Optional[str]
+    verification_observed_state: Optional[str] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Finding":
+        return cls(**{field.name: row[field.name] for field in dataclasses.fields(cls)})
+
+
+@dataclass(frozen=True)
+class VerifiedEvidence:
+    """Typed result of a governed existence/state lookup for finding evidence.
+
+    Produced only by the governed adapters (:func:`fetch_linear_issue_evidence`
+    and :func:`fetch_decision_record_evidence`). ``verify_finding`` refuses
+    free-form strings: a syntactically shaped reference is structure, not
+    behavioral proof that the queue target or decision record exists.
+    """
+
+    source: str
+    object_type: str
+    canonical_id: str
+    evidence_ref: str
+    observed_state: str
+    observed_at: int
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1308,6 +1573,66 @@ CREATE TABLE IF NOT EXISTS telemetry_review_findings (
     report_json       TEXT NOT NULL
 );
 
+-- Durable registry of explicit decision records (rejected / deferred /
+-- not-applicable dispositions). ``fetch_decision_record_evidence`` performs
+-- its existence lookup against this table, so a decision reference cannot be
+-- attested unless the decision was actually recorded with an author and
+-- rationale first.
+CREATE TABLE IF NOT EXISTS finding_decision_records (
+    decision_ref TEXT PRIMARY KEY,
+    actor_id     TEXT NOT NULL,
+    rationale    TEXT NOT NULL,
+    recorded_at  INTEGER NOT NULL
+);
+
+-- Queryable disposition gate for accepted TRC/readout findings. This remains
+-- in the existing Kanban database and event stream rather than creating a
+-- second telemetry store. A finding is an orphan until a valid disposition is
+-- both recorded and verified against its queue or decision evidence.
+CREATE TABLE IF NOT EXISTS findings (
+    finding_key         TEXT PRIMARY KEY,
+    work_intent_id      TEXT NOT NULL REFERENCES tasks(id),
+    source_system       TEXT NOT NULL CHECK (source_system IN ('trc', 'readout')),
+    source_ref          TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    owner_id            TEXT NOT NULL,
+    disposition         TEXT CHECK (disposition IN (
+        'accepted_queued', 'accepted_existing', 'rejected', 'deferred',
+        'not_applicable'
+    )),
+    linear_issue_id     TEXT,
+    decision_record_ref TEXT,
+    opened_at           INTEGER NOT NULL,
+    dispositioned_at    INTEGER,
+    verified_at         INTEGER,
+    verification_evidence_ref TEXT,
+    verification_source TEXT,
+    verification_observed_state TEXT,
+    CHECK (
+        disposition IS NULL
+        OR (
+            disposition IN ('accepted_queued', 'accepted_existing')
+            AND linear_issue_id IS NOT NULL
+            AND decision_record_ref IS NULL
+        )
+        OR (
+            disposition IN ('rejected', 'deferred', 'not_applicable')
+            AND linear_issue_id IS NULL
+            AND decision_record_ref IS NOT NULL
+        )
+    )
+);
+
+-- Finding lifecycle triggers are managed by ``_ensure_finding_triggers``
+-- (called from ``_migrate_add_optional_columns``), NOT here. Two reasons:
+--   1. ``CREATE TRIGGER IF NOT EXISTS`` can never upgrade a stale trigger
+--      body on a legacy board, and these bodies carry the replay-safety
+--      and immutability contracts — they must be current everywhere.
+--   2. The verification trigger references ``verification_observed_state``,
+--      which legacy ``findings`` tables gain only during the additive
+--      column migration; creating the trigger first would make every
+--      subsequent UPDATE on ``findings`` fail with "no such column".
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1380,6 +1705,8 @@ CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_created        ON task_events(created_at, id);
+CREATE INDEX IF NOT EXISTS idx_findings_intent        ON findings(work_intent_id, opened_at);
+CREATE INDEX IF NOT EXISTS idx_findings_disposition   ON findings(disposition, verified_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_review_runs_boundary  ON telemetry_review_runs(board_slug, window_end);
@@ -2335,6 +2662,168 @@ def init_db(
     return path
 
 
+def _ensure_finding_triggers(conn: sqlite3.Connection) -> None:
+    """(Re)create the finding lifecycle triggers with their current bodies.
+
+    DROP + CREATE, never ``CREATE TRIGGER IF NOT EXISTS``: legacy boards
+    carry the old narrow bodies (no ``NOT EXISTS`` replay guard on the
+    promotion trigger; immutability on ``disposition`` only). Those bodies
+    encode the replay-safety and immutability contracts, so they must be
+    upgraded in place on every board this code touches.
+
+    The immutability triggers deliberately only fire when the OLD row
+    already carries a non-null disposition / verification: the governed
+    ``disposition_finding`` / ``verify_finding`` UPDATEs set the bound
+    fields FROM NULL, which the ``OLD.x IS NOT NULL`` guard exempts.
+    """
+    conn.execute("DROP TRIGGER IF EXISTS trg_telemetry_finding_to_ledger")
+    # Legacy narrow-immutability trigger name from the first HEL-3112 head.
+    conn.execute("DROP TRIGGER IF EXISTS trg_finding_disposition_immutable")
+    conn.execute("DROP TRIGGER IF EXISTS trg_finding_disposition_bound_immutable")
+    conn.execute("DROP TRIGGER IF EXISTS trg_finding_verification_immutable")
+    conn.execute(
+        """
+        CREATE TRIGGER trg_telemetry_finding_to_ledger
+        AFTER INSERT ON telemetry_review_findings
+        WHEN json_extract(NEW.subject_json, '$.task_ids[0]') IS NOT NULL
+         AND EXISTS (
+             SELECT 1 FROM tasks
+              WHERE id = json_extract(NEW.subject_json, '$.task_ids[0]')
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM findings WHERE finding_key = NEW.finding_key
+         )
+        BEGIN
+            INSERT INTO findings (
+                finding_key, work_intent_id, source_system, source_ref,
+                title, owner_id, opened_at
+            ) VALUES (
+                NEW.finding_key,
+                json_extract(NEW.subject_json, '$.task_ids[0]'),
+                'trc',
+                'telemetry:' || NEW.finding_key,
+                COALESCE(json_extract(NEW.report_json, '$.title'), NEW.rule_id),
+                COALESCE(json_extract(NEW.report_json, '$.owner'), 'OWNER.UNRESOLVED'),
+                NEW.first_observed_at
+            );
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER trg_finding_disposition_bound_immutable
+        BEFORE UPDATE ON findings
+        WHEN OLD.disposition IS NOT NULL
+         AND (NEW.disposition IS NOT OLD.disposition
+           OR NEW.linear_issue_id IS NOT OLD.linear_issue_id
+           OR NEW.decision_record_ref IS NOT OLD.decision_record_ref
+           OR NEW.dispositioned_at IS NOT OLD.dispositioned_at)
+        BEGIN
+            SELECT RAISE(ABORT,
+                'disposition is immutable: bound evidence fields are frozen');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER trg_finding_verification_immutable
+        BEFORE UPDATE ON findings
+        WHEN OLD.verified_at IS NOT NULL
+         AND (NEW.verified_at IS NOT OLD.verified_at
+           OR NEW.verification_evidence_ref IS NOT OLD.verification_evidence_ref
+           OR NEW.verification_source IS NOT OLD.verification_source
+           OR NEW.verification_observed_state IS NOT OLD.verification_observed_state)
+        BEGIN
+            SELECT RAISE(ABORT,
+                'verification is immutable: attested evidence fields are frozen');
+        END
+        """
+    )
+
+
+def _ensure_finding_rescue_task(conn: sqlite3.Connection) -> None:
+    """Create the durable rescue work-intent for rehomed finding evidence."""
+    conn.execute(
+        "INSERT OR IGNORE INTO tasks (id, title, status, created_at, workspace_kind) "
+        "VALUES (?, ?, 'archived', ?, 'scratch')",
+        (
+            FINDING_RESCUE_TASK_ID,
+            "Finding evidence rescue container (durable retained work-intent)",
+            int(time.time()),
+        ),
+    )
+
+
+def _backfill_telemetry_findings(conn: sqlite3.Connection) -> None:
+    """Idempotently promote retained telemetry findings into the ledger.
+
+    Telemetry review findings recorded before the promotion trigger existed
+    (or while it carried the narrow legacy body) never reached the canonical
+    ``findings`` ledger, so they surfaced through ``list_orphan_findings``
+    as synthesized orphans that ``disposition_finding`` could not act on
+    (``unknown finding_key``). Rows whose task still exists are promoted
+    against that task; rows whose task is absent are rehomed to the durable
+    rescue work-intent with a ``finding_rehomed`` event — the governed
+    resolution that keeps the evidence dispositionable.
+    """
+    telemetry_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'telemetry_review_findings'"
+    ).fetchone()
+    if not telemetry_exists:
+        return
+    rows = conn.execute(
+        """
+        SELECT finding_key, rule_id, subject_json, report_json, first_observed_at
+          FROM telemetry_review_findings
+         WHERE finding_key NOT IN (SELECT finding_key FROM findings)
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            subject = json.loads(row["subject_json"])
+            report = json.loads(row["report_json"])
+        except (TypeError, ValueError):
+            subject, report = {}, {}
+        task_ids = subject.get("task_ids") if isinstance(subject, dict) else None
+        task_id = task_ids[0] if isinstance(task_ids, list) and task_ids else None
+        rehomed = False
+        if not task_id or conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (str(task_id),)
+        ).fetchone() is None:
+            _ensure_finding_rescue_task(conn)
+            task_id = FINDING_RESCUE_TASK_ID
+            rehomed = True
+        title = report.get("title") if isinstance(report, dict) else None
+        owner = report.get("owner") if isinstance(report, dict) else None
+        conn.execute(
+            "INSERT OR IGNORE INTO findings ("
+            " finding_key, work_intent_id, source_system, source_ref,"
+            " title, owner_id, opened_at"
+            ") VALUES (?, ?, 'trc', ?, ?, ?, ?)",
+            (
+                row["finding_key"],
+                str(task_id),
+                f"telemetry:{row['finding_key']}",
+                str(title or row["rule_id"]),
+                str(owner or "OWNER.UNRESOLVED"),
+                int(row["first_observed_at"]),
+            ),
+        )
+        if rehomed:
+            finding = get_finding(conn, row["finding_key"])
+            if finding is not None:
+                _append_finding_event(
+                    conn,
+                    finding,
+                    "finding_rehomed",
+                    actor_id="kanban-migration",
+                    from_state="UNHOMED",
+                    to_state="opened",
+                    reason_code="telemetry_backfill_task_absent",
+                )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2478,6 +2967,46 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_attachments_content "
             "ON task_attachments(task_id, content_sha256)"
         )
+
+    finding_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'findings'"
+    ).fetchone()
+    if finding_table_exists:
+        finding_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(findings)")
+        }
+        if "verification_evidence_ref" not in finding_cols:
+            _add_column_if_missing(
+                conn, "findings", "verification_evidence_ref",
+                "verification_evidence_ref TEXT",
+            )
+        if "verification_source" not in finding_cols:
+            _add_column_if_missing(
+                conn, "findings", "verification_source", "verification_source TEXT"
+            )
+        if "verification_observed_state" not in finding_cols:
+            # Legacy boards predate the governed-adapter attestation; the
+            # column must exist BEFORE the verification-immutability trigger
+            # below is (re)created, or every UPDATE on findings fails with
+            # "no such column".
+            _add_column_if_missing(
+                conn, "findings", "verification_observed_state",
+                "verification_observed_state TEXT",
+            )
+        # DROP + recreate the finding lifecycle triggers unconditionally.
+        # ``CREATE TRIGGER IF NOT EXISTS`` can never upgrade a stale trigger
+        # body, and legacy boards carry the old narrow bodies (no replay
+        # guard, disposition-only immutability). The bodies encode the
+        # replay-safety and immutability contracts, so they must be current
+        # on every board this code touches.
+        _ensure_finding_triggers(conn)
+        # Idempotent backfill: telemetry review findings recorded before the
+        # promotion trigger existed (or while it had the narrow body) never
+        # made it into the canonical ledger, so they surfaced as
+        # undispositionable orphans. Rows whose task still exists join the
+        # ledger against that task; rows whose task is gone are rehomed to
+        # the durable rescue work-intent so they remain dispositionable.
+        _backfill_telemetry_findings(conn)
 
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
@@ -4171,6 +4700,542 @@ def _append_work_intent_event(
     _append_event(conn, task_id, storage_kind, payload, run_id=run_id)
 
 
+_FINDING_POLICY_VERSION = "HEL-3112-v1"
+
+
+def _validate_finding_ref(value: str, *, field_name: str) -> str:
+    """Return a minimized durable reference and reject local filesystem paths."""
+    ref = (value or "").strip()
+    if not ref:
+        raise ValueError(f"{field_name} is required")
+    if ref.startswith(("/", "file://")) or re.match(r"^[A-Za-z]:[\\/]", ref):
+        raise ValueError(f"{field_name} must not be a local absolute path")
+    return ref
+
+
+def get_finding(conn: sqlite3.Connection, finding_key: str) -> Optional[Finding]:
+    row = conn.execute(
+        "SELECT * FROM findings WHERE finding_key = ?", (finding_key.strip(),)
+    ).fetchone()
+    return Finding.from_row(row) if row else None
+
+
+def list_findings(conn: sqlite3.Connection) -> list[Finding]:
+    rows = conn.execute(
+        "SELECT * FROM findings ORDER BY opened_at ASC, finding_key ASC"
+    ).fetchall()
+    return [Finding.from_row(row) for row in rows]
+
+
+def list_orphan_findings(conn: sqlite3.Connection) -> list[Finding]:
+    """Return accepted findings that have not completed the queue gate."""
+    rows = conn.execute(
+        """
+        SELECT *
+          FROM findings
+         WHERE disposition IS NULL
+            OR verified_at IS NULL
+            OR (
+                disposition IN ('accepted_queued', 'accepted_existing')
+                AND linear_issue_id IS NULL
+            )
+            OR (
+                disposition IN ('rejected', 'deferred', 'not_applicable')
+                AND decision_record_ref IS NULL
+            )
+         ORDER BY opened_at ASC, finding_key ASC
+        """
+    ).fetchall()
+    findings = [Finding.from_row(row) for row in rows]
+    known = {finding.finding_key for finding in findings}
+    telemetry_rows = conn.execute(
+        """
+        SELECT finding_key, subject_json, rule_id, report_json, first_observed_at
+          FROM telemetry_review_findings
+         WHERE finding_key NOT IN (SELECT finding_key FROM findings)
+         ORDER BY first_observed_at ASC, finding_key ASC
+        """
+    ).fetchall()
+    for row in telemetry_rows:
+        if row["finding_key"] in known:
+            continue
+        try:
+            subject = json.loads(row["subject_json"])
+            report = json.loads(row["report_json"])
+        except (TypeError, ValueError):
+            subject, report = {}, {}
+        task_ids = subject.get("task_ids") if isinstance(subject, dict) else []
+        task_id = task_ids[0] if isinstance(task_ids, list) and task_ids else "UNKNOWN"
+        findings.append(Finding(
+            finding_key=row["finding_key"],
+            work_intent_id=str(task_id),
+            source_system="trc",
+            source_ref=f"telemetry:{row['finding_key']}",
+            title=str(report.get("title") or row["rule_id"]),
+            owner_id=str(report.get("owner") or "OWNER.UNRESOLVED"),
+            disposition=None,
+            linear_issue_id=None,
+            decision_record_ref=None,
+            opened_at=int(row["first_observed_at"]),
+            dispositioned_at=None,
+            verified_at=None,
+            verification_evidence_ref=None,
+            verification_source=None,
+        ))
+    return findings
+
+
+def _append_finding_event(
+    conn: sqlite3.Connection,
+    finding: Finding,
+    event_type: str,
+    *,
+    actor_id: str,
+    from_state: str,
+    to_state: str,
+    reason_code: str,
+) -> None:
+    if event_type not in FINDING_EVENT_TYPES:
+        raise ValueError(f"unsupported finding event type: {event_type}")
+    now = time.time()
+    source_event_id = f"finding:{finding.finding_key}:{event_type}"
+    payload = {
+        "event_id": f"evt_{secrets.token_hex(16)}",
+        "occurred_at": _utc_source_time(now),
+        "recorded_at": _utc_source_time(now),
+        "event_type": event_type,
+        "source_system": "kanban",
+        "source_event_id": source_event_id,
+        "work_intent_id": finding.work_intent_id,
+        "task_id": finding.work_intent_id,
+        "run_id": None,
+        "session_id": None,
+        "linear_issue_id": finding.linear_issue_id,
+        "repo": None,
+        "pr_number": None,
+        "head_sha": None,
+        "deployment_id": None,
+        "environment": None,
+        "deployed_sha": None,
+        "actor_type": "profile",
+        "actor_id": actor_id,
+        "node_id": _claimer_id().split(":", 1)[0],
+        "from_state": from_state,
+        "to_state": to_state,
+        "reason_code": reason_code,
+        "causation_event_id": None,
+        "idempotency_key": f"finding:{finding.finding_key}:{event_type}",
+        "evidence_ref": f"finding:{finding.finding_key}",
+        "policy_version": _FINDING_POLICY_VERSION,
+        "schema_version": 1,
+        "finding_key": finding.finding_key,
+        "finding_source_system": finding.source_system,
+        "finding_source_ref": finding.source_ref,
+        "disposition": finding.disposition,
+        "decision_record_ref": finding.decision_record_ref,
+    }
+    _append_event(
+        conn,
+        finding.work_intent_id,
+        event_type,
+        payload,
+        run_id=None,
+    )
+
+
+def open_finding(
+    conn: sqlite3.Connection,
+    *,
+    finding_key: str,
+    work_intent_id: str,
+    source_system: str,
+    source_ref: str,
+    title: str,
+    owner_id: str,
+    actor_id: str,
+) -> Finding:
+    """Open one accepted TRC/readout finding, replay-safe by stable key."""
+    key = (finding_key or "").strip()
+    intent = (work_intent_id or "").strip()
+    source = (source_system or "").strip().lower()
+    finding_title = (title or "").strip()
+    owner = (owner_id or "").strip()
+    actor = (actor_id or "").strip()
+    ref = _validate_finding_ref(source_ref, field_name="source_ref")
+    if not key:
+        raise ValueError("finding_key is required")
+    if source not in {"trc", "readout"}:
+        raise ValueError("source_system must be 'trc' or 'readout'")
+    if not finding_title or not owner or not actor:
+        raise ValueError("title, owner_id, and actor_id are required")
+    if get_task(conn, intent) is None:
+        raise ValueError(f"unknown work_intent_id: {intent}")
+
+    with write_txn(conn):
+        existing = get_finding(conn, key)
+        if existing:
+            expected = (
+                intent, source, ref, finding_title, owner,
+            )
+            actual = (
+                existing.work_intent_id,
+                existing.source_system,
+                existing.source_ref,
+                existing.title,
+                existing.owner_id,
+            )
+            if actual != expected:
+                raise ValueError(
+                    f"finding {key!r} already exists with different evidence"
+                )
+            return existing
+        conn.execute(
+            """
+            INSERT INTO findings (
+                finding_key, work_intent_id, source_system, source_ref,
+                title, owner_id, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (key, intent, source, ref, finding_title, owner, int(time.time())),
+        )
+        finding = get_finding(conn, key)
+        assert finding is not None
+        _append_finding_event(
+            conn,
+            finding,
+            "finding_opened",
+            actor_id=actor,
+            from_state="UNKNOWN",
+            to_state="opened",
+            reason_code="accepted_review_finding",
+        )
+        return finding
+
+
+def disposition_finding(
+    conn: sqlite3.Connection,
+    *,
+    finding_key: str,
+    disposition: str,
+    actor_id: str,
+    linear_issue_id: Optional[str] = None,
+    decision_record_ref: Optional[str] = None,
+) -> Finding:
+    """Record the finding's one immutable queue/decision disposition."""
+    key = (finding_key or "").strip()
+    value = (disposition or "").strip()
+    actor = (actor_id or "").strip()
+    linear_id = (linear_issue_id or "").strip() or None
+    decision_ref = (decision_record_ref or "").strip() or None
+    if value not in FINDING_DISPOSITIONS:
+        raise ValueError(f"unsupported disposition: {value!r}")
+    if not actor:
+        raise ValueError("actor_id is required")
+    if value in ACCEPTED_FINDING_DISPOSITIONS:
+        if not linear_id:
+            raise ValueError(f"{value} requires linear_issue_id")
+        if decision_ref:
+            raise ValueError(f"{value} cannot carry decision_record_ref")
+    else:
+        if not decision_ref:
+            raise ValueError(f"{value} requires decision_record_ref")
+        decision_ref = _validate_finding_ref(
+            decision_ref, field_name="decision_record_ref"
+        )
+        if linear_id:
+            raise ValueError(f"{value} cannot carry linear_issue_id")
+
+    with write_txn(conn):
+        existing = get_finding(conn, key)
+        if existing is None:
+            raise ValueError(f"unknown finding_key: {key}")
+        if existing.disposition is not None:
+            if (
+                existing.disposition == value
+                and existing.linear_issue_id == linear_id
+                and existing.decision_record_ref == decision_ref
+            ):
+                return existing
+            raise ValueError(f"finding {key!r} already has disposition")
+        conn.execute(
+            """
+            UPDATE findings
+               SET disposition = ?, linear_issue_id = ?,
+                   decision_record_ref = ?, dispositioned_at = ?
+             WHERE finding_key = ? AND disposition IS NULL
+            """,
+            (value, linear_id, decision_ref, int(time.time()), key),
+        )
+        finding = get_finding(conn, key)
+        assert finding is not None
+        _append_finding_event(
+            conn,
+            finding,
+            "finding_dispositioned",
+            actor_id=actor,
+            from_state="opened",
+            to_state=value,
+            reason_code=value,
+        )
+        if value in ACCEPTED_FINDING_DISPOSITIONS:
+            _append_finding_event(
+                conn,
+                finding,
+                "finding_queued",
+                actor_id=actor,
+                from_state=value,
+                to_state="queued",
+                reason_code=value,
+            )
+        return finding
+
+
+_LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
+_LINEAR_ISSUE_QUERY = (
+    "query FindingEvidence($id: String!) {"
+    " issue(id: $id) { id identifier state { name } } }"
+)
+
+
+def record_finding_decision(
+    conn: sqlite3.Connection,
+    *,
+    decision_ref: str,
+    actor_id: str,
+    rationale: str,
+) -> str:
+    """Durably record an explicit not-applicable/deferred/rejected decision.
+
+    ``fetch_decision_record_evidence`` refuses to attest a decision reference
+    that was never recorded here, so a free-form string can no longer close
+    the gate.
+    """
+    ref = _validate_finding_ref(decision_ref, field_name="decision_record_ref")
+    actor = (actor_id or "").strip()
+    reason = (rationale or "").strip()
+    if not actor:
+        raise ValueError("actor_id is required")
+    if not reason:
+        raise ValueError("rationale is required")
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT actor_id, rationale FROM finding_decision_records "
+            "WHERE decision_ref = ?",
+            (ref,),
+        ).fetchone()
+        if existing is not None:
+            if existing["actor_id"] == actor and existing["rationale"] == reason:
+                return ref
+            raise ValueError(
+                f"decision record {ref!r} already exists with different content"
+            )
+        conn.execute(
+            "INSERT INTO finding_decision_records "
+            "(decision_ref, actor_id, rationale, recorded_at) VALUES (?, ?, ?, ?)",
+            (ref, actor, reason, int(time.time())),
+        )
+    return ref
+
+
+def fetch_linear_issue_evidence(
+    issue_id: str,
+    *,
+    api_key: Optional[str] = None,
+    transport: Optional[Any] = None,
+) -> VerifiedEvidence:
+    """Governed adapter: prove a Linear issue exists via GraphQL lookup.
+
+    Performs (or, in tests, injects via ``transport``) a live existence/state
+    lookup and binds the canonical Linear UUID, observed workflow state, and
+    verification time into a typed :class:`VerifiedEvidence`. A syntactically
+    valid but nonexistent issue id raises — structure is not proof.
+
+    ``transport`` is a callable ``(query, variables) -> response_dict`` used
+    for hermetic tests; production resolves ``LINEAR_API_KEY`` and calls the
+    real GraphQL endpoint.
+    """
+    issue = (issue_id or "").strip()
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-[1-9][0-9]*", issue):
+        raise ValueError(f"invalid Linear issue id: {issue_id!r}")
+    if transport is None:
+        key = (api_key or os.environ.get("LINEAR_API_KEY") or "").strip()
+        if not key:
+            raise ValueError(
+                "linear_graphql verification requires LINEAR_API_KEY"
+            )
+
+        def _live_transport(query: str, variables: dict) -> dict:
+            import urllib.request
+
+            request = urllib.request.Request(
+                _LINEAR_GRAPHQL_URL,
+                data=json.dumps(
+                    {"query": query, "variables": variables}
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": key,
+                },
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        transport = _live_transport
+
+    payload = transport(_LINEAR_ISSUE_QUERY, {"id": issue})
+    node = None
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            node = data.get("issue")
+    if not isinstance(node, dict) or not node.get("id"):
+        raise ValueError(
+            f"Linear issue {issue} does not exist or is not accessible"
+        )
+    identifier = str(node.get("identifier") or issue)
+    if identifier != issue:
+        raise ValueError(
+            f"Linear returned {identifier!r} for requested issue {issue!r}"
+        )
+    state = node.get("state")
+    observed_state = "UNKNOWN"
+    if isinstance(state, dict) and state.get("name"):
+        observed_state = str(state["name"])
+    return VerifiedEvidence(
+        source="linear_graphql",
+        object_type="linear_issue",
+        canonical_id=issue,
+        evidence_ref=f"linear:{issue}:{node['id']}",
+        observed_state=observed_state,
+        observed_at=int(time.time()),
+    )
+
+
+def fetch_decision_record_evidence(
+    conn: sqlite3.Connection, decision_ref: str
+) -> VerifiedEvidence:
+    """Governed adapter: prove a decision record was durably recorded."""
+    ref = _validate_finding_ref(decision_ref, field_name="decision_record_ref")
+    row = conn.execute(
+        "SELECT actor_id, rationale, recorded_at FROM finding_decision_records "
+        "WHERE decision_ref = ?",
+        (ref,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"decision record {ref!r} does not exist; record it with "
+            "record_finding_decision first"
+        )
+    return VerifiedEvidence(
+        source="decision_record",
+        object_type="decision_record",
+        canonical_id=ref,
+        evidence_ref=ref,
+        observed_state=f"recorded_by:{row['actor_id']}",
+        observed_at=int(time.time()),
+    )
+
+
+def verify_finding(
+    conn: sqlite3.Connection,
+    finding_key: str,
+    *,
+    actor_id: str,
+    evidence: VerifiedEvidence,
+) -> Finding:
+    """Close the gate with typed, adapter-attested verification evidence.
+
+    Only a :class:`VerifiedEvidence` produced by a governed adapter
+    (:func:`fetch_linear_issue_evidence`, :func:`fetch_decision_record_evidence`)
+    is accepted. Free-form strings and unknown sources are rejected: a
+    reference that merely looks right is structure, not behavioral proof.
+    """
+    key = (finding_key or "").strip()
+    actor = (actor_id or "").strip()
+    if not actor:
+        raise ValueError("actor_id is required")
+    if not isinstance(evidence, VerifiedEvidence):
+        raise ValueError(
+            "verification requires a typed VerifiedEvidence from a governed "
+            "adapter; free-form evidence strings are rejected"
+        )
+    if evidence.source not in FINDING_VERIFICATION_SOURCES:
+        raise ValueError(
+            f"unknown verification source: {evidence.source!r}"
+        )
+    evidence_ref = _validate_finding_ref(
+        evidence.evidence_ref, field_name="verification evidence reference"
+    )
+    if not evidence.observed_state or not evidence.observed_at:
+        raise ValueError("verification evidence must carry observed state and time")
+    with write_txn(conn):
+        existing = get_finding(conn, key)
+        if existing is None:
+            raise ValueError(f"unknown finding_key: {key}")
+        if existing.disposition is None:
+            raise ValueError(f"finding {key!r} has no disposition")
+        if existing.verified_at is not None:
+            if (
+                existing.verification_evidence_ref == evidence_ref
+                and existing.verification_source == evidence.source
+            ):
+                return existing
+            raise ValueError(f"finding {key!r} already has different verification evidence")
+        if existing.disposition in ACCEPTED_FINDING_DISPOSITIONS:
+            if evidence.source != "linear_graphql":
+                raise ValueError(
+                    "accepted dispositions require linear_graphql evidence"
+                )
+            if not existing.linear_issue_id or not re.fullmatch(
+                r"[A-Z][A-Z0-9]*-[1-9][0-9]*", existing.linear_issue_id
+            ):
+                raise ValueError(
+                    f"finding {key!r} has an invalid Linear issue reference"
+                )
+            if evidence.canonical_id != existing.linear_issue_id:
+                raise ValueError(
+                    f"verification evidence must attest Linear issue {existing.linear_issue_id}"
+                )
+            expected_prefix = f"linear:{existing.linear_issue_id}:"
+            if not evidence_ref.startswith(expected_prefix):
+                raise ValueError(
+                    f"verification evidence must attest Linear issue {existing.linear_issue_id}"
+                )
+        else:
+            if evidence.source != "decision_record":
+                raise ValueError(
+                    "non-accepted dispositions require decision_record evidence"
+                )
+            if evidence_ref != existing.decision_record_ref:
+                raise ValueError(
+                    "verification evidence must match the disposition decision record"
+                )
+        conn.execute(
+            "UPDATE findings SET verified_at = ?, verification_evidence_ref = ?, "
+            "verification_source = ?, verification_observed_state = ? "
+            "WHERE finding_key = ?",
+            (
+                int(time.time()),
+                evidence_ref,
+                evidence.source,
+                evidence.observed_state,
+                key,
+            ),
+        )
+        finding = get_finding(conn, key)
+        assert finding is not None
+        _append_finding_event(
+            conn,
+            finding,
+            "finding_verified",
+            actor_id=actor,
+            from_state=finding.disposition or "UNKNOWN",
+            to_state="verified",
+            reason_code="queue_evidence_verified",
+        )
+        return finding
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4847,6 +5912,27 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+        # Count the reclaim against the unified failure counter so repeated
+        # stale-TTL reclaims trip the circuit breaker (HEL-3135). Timeout /
+        # crash paths already funnel here; without this call a task can loop
+        # ready→running→reclaimed forever while consecutive_failures stays
+        # at 0. Outside the write_txn because _record_task_failure opens its
+        # own. Manual reclaim_task is operator-driven and stays uncounted.
+        if cur.rowcount == 1:
+            _record_task_failure(
+                conn, row["id"],
+                error=f"stale_lock={row['claim_lock']}",
+                outcome="reclaimed",
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "heartbeat_stale": bool(heartbeat_stale),
+                },
+            )
     return reclaimed
 
 
@@ -6764,6 +7850,56 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+def _rehome_or_delete_findings(conn: sqlite3.Connection, task_id: str) -> None:
+    """Resolve finding-ledger retention before a task row is deleted.
+
+    Findings whose evidence source is still retained in
+    ``telemetry_review_findings`` are rehomed to the durable rescue
+    work-intent (with a ``finding_rehomed`` event) instead of deleted:
+    deleting the ledger row while retaining the source would resurrect the
+    finding as an undispositionable orphan through
+    ``list_orphan_findings``'s source synthesis. Findings with no retained
+    source cascade-delete with the task, exactly as before.
+
+    Must run inside the caller's ``write_txn`` before ``tasks`` is deleted
+    (``findings.work_intent_id`` references ``tasks(id)``).
+    """
+    rows = conn.execute(
+        "SELECT finding_key FROM findings WHERE work_intent_id = ?", (task_id,)
+    ).fetchall()
+    if not rows:
+        return
+    retained = {
+        row["finding_key"]
+        for row in conn.execute(
+            "SELECT finding_key FROM telemetry_review_findings "
+            "WHERE finding_key IN (SELECT finding_key FROM findings "
+            "                       WHERE work_intent_id = ?)",
+            (task_id,),
+        )
+    }
+    to_rehome = [row["finding_key"] for row in rows if row["finding_key"] in retained]
+    if to_rehome:
+        _ensure_finding_rescue_task(conn)
+        for key in to_rehome:
+            conn.execute(
+                "UPDATE findings SET work_intent_id = ? WHERE finding_key = ?",
+                (FINDING_RESCUE_TASK_ID, key),
+            )
+            finding = get_finding(conn, key)
+            if finding is not None:
+                _append_finding_event(
+                    conn,
+                    finding,
+                    "finding_rehomed",
+                    actor_id="kanban-purge",
+                    from_state=task_id,
+                    to_state=FINDING_RESCUE_TASK_ID,
+                    reason_code="task_purged_source_retained",
+                )
+    conn.execute("DELETE FROM findings WHERE work_intent_id = ?", (task_id,))
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
@@ -6771,6 +7907,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     tasks must be explicitly archived first so accidental data loss requires a
     second deliberate action.
     """
+    if task_id == FINDING_RESCUE_TASK_ID:
+        # The rescue container holds rehomed immutable finding evidence;
+        # purging it would orphan that evidence permanently.
+        return False
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -6786,6 +7926,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _rehome_or_delete_findings(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -6800,6 +7941,9 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found or is an unsatisfied PPMA scope gate.
     """
+    if task_id == FINDING_RESCUE_TASK_ID:
+        # See delete_archived_task: rehomed finding evidence is durable.
+        return False
     # Deleting an unsatisfied PPMA gate would remove its dependency edges, and
     # the trailing recompute would incorrectly make execution children ready.
     if is_ppma_scope_gate(conn, task_id):
@@ -6811,14 +7955,16 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if scope is None:
             return False
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        exists = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if exists is None:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _rehome_or_delete_findings(conn, task_id)
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -7469,6 +8615,14 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"terminal_loop_error"`` — ``WIFEXITED`` with status
+      ``KANBAN_TERMINAL_LOOP_EXIT_CODE``. Conversation loop terminal failure
+      (truncation give-up, etc.); see #17 auto-block path.
+    * ``"forced_signal"`` — ``WIFEXITED`` with status in the shell signal
+      range ``128 + N`` (e.g. 143 = SIGTERM). The kanban worker's SIGTERM
+      handler intentionally exits this way so a reclaim / max-runtime kill
+      is distinguishable from a genuine clean exit. Mapped as a signaled
+      crash (not a protocol violation).
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -7476,8 +8630,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``terminal_loop_error`` / ``nonzero_exit`` / ``forced_signal``) or the
+    signal number (for ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -7490,6 +8644,16 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_TERMINAL_LOOP_EXIT_CODE:
+                return ("terminal_loop_error", code)
+            # Shell/bash convention: 128 + signum. Worker SIGTERM handler
+            # exits 143 so we never mislabel a forced kill as clean.
+            if (
+                KANBAN_FORCED_SIGNAL_EXIT_BASE
+                < code
+                <= KANBAN_FORCED_SIGNAL_EXIT_BASE + 64
+            ):
+                return ("forced_signal", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -7990,14 +9154,15 @@ def detect_stale_running(
             }
             payload.update(termination)
 
+            error = (
+                f"no heartbeat for {int(hb_age)}s "
+                if hb_age is not None
+                else "no heartbeat ever"
+            ) + f" after {int(elapsed)}s running"
             run_id = _end_run(
                 conn, tid,
                 outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
+                error=error,
                 metadata=payload,
             )
             _append_event(
@@ -8005,15 +9170,31 @@ def detect_stale_running(
             )
             reclaimed.append(tid)
 
-        # Intentionally NOT calling _record_task_failure here. Stale reclaim
-        # is dispatcher-side detection of an absent heartbeat; the task is
-        # going straight back to ``ready`` for re-dispatch. Counting it as
-        # a worker failure would let two legitimately-long-running tasks
-        # (>4h without explicit heartbeat) trip the circuit breaker and
-        # auto-block, even though no worker actually failed. The 'stale'
-        # event already lives in task_events for auditability; that's the
-        # right surface for "this happened" without conflating with the
-        # spawn_failed / timed_out / crashed counters.
+        # Count the reclaim against the unified failure counter so repeated
+        # no-heartbeat stale reclaims trip the circuit breaker (HEL-3135).
+        # Previously this path requeued to `ready` without touching
+        # consecutive_failures, which let a single stuck card re-dispatch
+        # dozens of times (production incident: t_8cea8385 ×65). Long-running
+        # legitimate work should heartbeat; the heartbeat mandate is the
+        # protection against false trips, not skipping the counter. Pattern
+        # matches enforce_max_runtime: call outside write_txn because
+        # _record_task_failure opens its own; on trip it flips ready→blocked
+        # and emits `gave_up` on top of the `stale` event already recorded.
+        if cur.rowcount == 1:
+            _record_task_failure(
+                conn, tid,
+                error=error,
+                outcome="stale",
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={
+                    "elapsed_seconds": int(elapsed),
+                    "heartbeat_age_seconds": (
+                        int(hb_age) if hb_age is not None else None
+                    ),
+                    "pid": int(pid) if pid else None,
+                },
+            )
 
     return reclaimed
 
@@ -8137,9 +9318,11 @@ def detect_crashed_workers(
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
-    # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    # counter (see the post-txn loop below). ``force_block`` trips the
+    # breaker on first occurrence (terminal loop / non-recoverable
+    # worker-reported failures) without waiting on either budget.
+    crash_details: list[tuple[str, int, str, bool, str, bool]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, force_block)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -8179,6 +9362,7 @@ def detect_crashed_workers(
             log_error_code = log_class[0] if log_class else None
             log_error_detail = log_class[1] if log_class else None
             rate_limited_exit = False
+            force_block = False
             if log_error_code == "billing_exhausted":
                 # Billing/credit exhaustion is a provider wall, not a task
                 # failure — same disposition as the EX_TEMPFAIL sentinel:
@@ -8247,12 +9431,56 @@ def detect_crashed_workers(
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "terminal_loop_error":
+                # Worker reported a conversation-loop failure (truncation
+                # give-up / partial stream) via KANBAN_TERMINAL_LOOP_EXIT_CODE
+                # but left the task ``running`` — the auto-block write failed
+                # (or an older worker only set the exit code). Distinguish
+                # this from a bare protocol_violation so BEL triage does not
+                # have to grep session logs (t_8165e956 acceptance #2).
+                # Force auto-block on first occurrence — retrying a terminal
+                # loop error is deterministic waste (not a paperwork miss).
+                protocol_violation = False
+                force_block = True
+                error_text = (
+                    f"{KANBAN_TERMINAL_LOOP_ERROR_PREFIX}"
+                    f"worker exited rc={code} without completing the task "
+                    f"(conversation loop ended; lifecycle write missing)"
+                )
+                event_kind = "terminal_loop_error"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "exit_kind": kind,
+                    "source": "worker_terminal_loop_error",
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
+                elif kind == "forced_signal":
+                    # rc = 128+signum (e.g. 143 = bash SIGTERM). Worker was
+                    # force-killed (reclaim, max_runtime, external SIGTERM) and
+                    # deliberately reported a non-zero status so we do NOT
+                    # count it as a clean-exit protocol_violation.
+                    sig = (
+                        int(code) - KANBAN_FORCED_SIGNAL_EXIT_BASE
+                        if code is not None else None
+                    )
+                    if sig == 15:
+                        error_text = (
+                            f"pid {pid} force-killed (SIGTERM, exit {code}) "
+                            f"— not a protocol violation"
+                        )
+                    else:
+                        error_text = (
+                            f"pid {pid} force-killed "
+                            f"(signal {sig}, exit {code}) "
+                            f"— not a protocol violation"
+                        )
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
@@ -8260,6 +9488,11 @@ def detect_crashed_workers(
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+                    if kind == "forced_signal":
+                        event_payload["forced_kill"] = True
+                        event_payload["signal"] = (
+                            int(code) - KANBAN_FORCED_SIGNAL_EXIT_BASE
+                        )
                 # Loud classification for startup failures: a bad skill pin
                 # or a missing assignee profile crashes the worker pre-flight
                 # with an otherwise-opaque "pid exited with code 1". Attach
@@ -8306,13 +9539,15 @@ def detect_crashed_workers(
                     )
                     rate_limited.append(row["id"])
                 else:
-                    if protocol_violation:
+                    if protocol_violation or force_block:
                         # Stamp the failure error now: a below-budget
                         # violation never reaches ``_record_task_failure``
                         # (which stamps this column for every other failure
                         # kind), yet the board UI and the retry worker's
                         # context still need the violation message + the
-                        # corrective guidance it carries.
+                        # corrective guidance it carries. force_block paths
+                        # also stamp early so triage sees the loop error
+                        # even if the force-trip call is racing.
                         conn.execute(
                             "UPDATE tasks SET last_failure_error = ? "
                             "WHERE id = ?",
@@ -8321,7 +9556,7 @@ def detect_crashed_workers(
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, force_block)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -8343,10 +9578,31 @@ def detect_crashed_workers(
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, claimer, protocol_violation, error_text, force_block in crash_details:
+            if force_block:
+                # Terminal loop / non-recoverable worker-reported failure:
+                # trip immediately. Do not route through the protocol-
+                # violation retry budget — truncating again won't help.
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="crashed",
+                    failure_limit=1,
+                    force_trip=True,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid,
+                        "claimer": claimer,
+                        "source": "worker_terminal_loop_error",
+                    },
+                )
+                if tripped:
+                    auto_blocked.append(tid)
+                continue
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -8429,8 +9685,8 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
-    """Record a non-success outcome (spawn_failed / crashed / timed_out)
-    and maybe trip the circuit breaker.
+    """Record a non-success outcome (spawn_failed / crashed / timed_out /
+    reclaimed / stale) and maybe trip the circuit breaker.
 
     Unified replacement for the old spawn-only ``_record_spawn_failure``.
     Every path that ends a task with a non-success outcome funnels
@@ -8498,6 +9754,29 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            #
+            # Persist a FLOOR of ``effective_limit`` on the stored counter,
+            # not the raw ``failures`` count. ``force_trip=True`` callers
+            # (protocol-violation streak, systemic crash fingerprint) trip
+            # on a threshold that has nothing to do with the unified
+            # ``consecutive_failures`` column — e.g. a violation streak of
+            # 3 force-trips with ``failure_limit=3`` while the column itself
+            # sat at 0 (reset by an earlier unblock), so ``failures`` here is
+            # only 1. Storing that raw ``1`` let ``recompute_ready`` — which
+            # runs later in the SAME dispatch tick and re-resolves its own
+            # (unrelated, often lower) effective_limit — see "1 < 2" and
+            # immediately promote the task straight back to ``ready``,
+            # undoing the trip within the same tick. Observed as an infinite
+            # blocked -> ready -> crash loop for zero-parent tasks (surfaced
+            # as `{"trigger": "parents_terminal", "satisfied_parent_ids":
+            # []}` since a zero-parent task's parent list is vacuously
+            # "all done"); t_d1994b5b hit this 96+ times. Flooring the
+            # stored value at the limit that actually tripped it makes any
+            # later re-check computing the same-or-lower limit correctly see
+            # the task as still over threshold; a genuinely higher configured
+            # limit can still recover it (unified counter semantics
+            # preserved, just no longer allowed to under-report).
+            stored_failures = max(failures, effective_limit)
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
@@ -8505,7 +9784,7 @@ def _record_task_failure(
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (stored_failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -8515,7 +9794,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (stored_failures, error[:500], task_id),
                 )
             run_id = None
             if end_run:

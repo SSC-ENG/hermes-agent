@@ -18,6 +18,13 @@ def board(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # READY_UNCLAIMED safeguards call profile_exists; default profiles dir
+    # is empty in this fixture home, so treat any assignee as spawnable
+    # unless a test overrides the lookup.
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda name: bool(name),
+    )
     kb.init_db()
     return home
 
@@ -188,3 +195,347 @@ def test_missing_nominal_boundary_emits_critical_review_health_hole(board):
     assert len(missed) == 1
     assert missed[0]["severity"] == "CRITICAL"
     assert missed[0]["owner"] == "rhea-ramos"
+
+
+def test_protocol_violation_first_is_high_repeat_is_critical(board):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="worker", assignee="felix-steele")
+        _insert_event(conn, task, "protocol_violation", {"pid": 1, "claimer": "host:1", "exit_code": 0}, end - 3000)
+        first = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        _insert_event(conn, task, "protocol_violation", {"pid": 2, "claimer": "host:1", "exit_code": 0}, end - 1000)
+        second = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    first_hole = next(h for h in first["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION")
+    second_hole = next(h for h in second["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION")
+    assert first_hole["severity"] == "HIGH"
+    assert second_hole["severity"] == "CRITICAL"
+
+
+def test_retry_thrash_flags_two_failures_and_escalates_on_breaker(board):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="thrashing", assignee="felix-steele")
+        _insert_event(conn, task, "crashed", {"pid": 1}, end - 5000)
+        _insert_event(conn, task, "timed_out", {}, end - 3000)
+        no_breaker = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        _insert_event(conn, task, "gave_up", {"failures": 3}, end - 1000)
+        with_breaker = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole_before = next(h for h in no_breaker["holes"] if h["rule_id"] == "FAILURE.RETRY_THRASH")
+    hole_after = next(h for h in with_breaker["holes"] if h["rule_id"] == "FAILURE.RETRY_THRASH")
+    assert hole_before["severity"] == "HIGH"
+    assert hole_after["severity"] == "CRITICAL"
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "expected_severity"),
+    [
+        (telemetry.BLOCKED_AGED_MEDIUM_SECONDS, "MEDIUM"),
+        (telemetry.BLOCKED_AGED_HIGH_SECONDS, "HIGH"),
+        (telemetry.BLOCKED_AGED_CRITICAL_SECONDS, "CRITICAL"),
+    ],
+)
+def test_blocked_aged_severity_ladder(board, age_seconds, expected_severity):
+    end = 1_800_000_000
+    blocked_at = end - age_seconds
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="blocked", assignee="felix-steele", initial_status="blocked")
+        conn.execute(
+            "UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?", (task,),
+        )
+        _insert_event(conn, task, "blocked", {"reason": "needs decision", "kind": "needs_input", "recurrences": 1}, blocked_at)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.BLOCKED_AGED")
+    assert hole["severity"] == expected_severity
+
+
+def test_todo_promotable_flags_stuck_task_after_two_ticks(board):
+    end = 1_800_000_000
+    eligible_since = end - telemetry.TODO_PROMOTABLE_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="felix-steele")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="felix-steele")
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            (eligible_since, parent),
+        )
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.TODO_PROMOTABLE")
+    assert hole["severity"] == "HIGH"
+    assert child in hole["subject"]["task_ids"]
+
+
+def test_todo_promotable_suppressed_after_promotion(board):
+    end = 1_800_000_000
+    eligible_since = end - telemetry.TODO_PROMOTABLE_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="felix-steele")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="felix-steele")
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = ? WHERE id IN (?, ?)",
+            (eligible_since, parent, child),
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        _insert_event(conn, child, "promoted", {"from_status": "todo", "to_status": "ready"}, eligible_since + 5)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    rule_ids = {h["rule_id"] for h in report["holes"]}
+    assert "STALL.TODO_PROMOTABLE" not in rule_ids
+
+
+def test_ready_unclaimed_flags_task_after_two_ticks(board):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="unclaimed", assignee="felix-steele")
+        _insert_event(conn, task, "created", {}, ready_since)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.READY_UNCLAIMED")
+    assert hole["severity"] == "HIGH"
+    assert task in hole["subject"]["task_ids"]
+
+
+def test_ready_unclaimed_suppressed_after_claim(board):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="claimed", assignee="felix-steele")
+        _insert_event(conn, task, "created", {}, ready_since)
+        _insert_event(conn, task, "claimed", {"lock": "host:1"}, ready_since + 5)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    rule_ids = {h["rule_id"] for h in report["holes"]}
+    assert "STALL.READY_UNCLAIMED" not in rule_ids
+
+
+def test_protocol_violation_escalates_across_tasks_for_same_profile(board):
+    """Spec ladder: CRITICAL on repeat per PROFILE, not only per task."""
+    end = 1_800_000_000
+    thr = telemetry.load_hole_rule_thresholds({})
+    with kb.connect_closing() as conn:
+        t1 = kb.create_task(conn, title="v1", assignee="felix-steele")
+        t2 = kb.create_task(conn, title="v2", assignee="felix-steele")
+        _insert_event(conn, t1, "protocol_violation", {"pid": 1}, end - 4000)
+        first = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end, thresholds=thr,
+        )
+        _insert_event(conn, t2, "protocol_violation", {"pid": 2}, end - 2000)
+        second = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end, thresholds=thr,
+        )
+    first_holes = [h for h in first["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION"]
+    second_holes = [h for h in second["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION"]
+    assert len(first_holes) == 1
+    assert first_holes[0]["severity"] == "HIGH"
+    assert len(second_holes) == 2
+    assert all(h["severity"] == "CRITICAL" for h in second_holes)
+
+
+def test_ready_unclaimed_unknown_when_profile_discovery_absent(board, monkeypatch):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+
+    def _boom(_name):
+        raise RuntimeError("profile catalog offline")
+
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", _boom)
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="unknown-slot", assignee="felix-steele")
+        _insert_event(conn, task, "created", {}, ready_since)
+        report = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end,
+        )
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.READY_UNCLAIMED")
+    assert hole["evidence_state"] == "UNKNOWN"
+    assert hole["severity"] != "HIGH"
+    assert task in hole["subject"]["task_ids"]
+
+
+def test_ready_unclaimed_suppressed_when_no_spawnable_slot(board, monkeypatch):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: False)
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="nonspawn", assignee="missing-profile")
+        _insert_event(conn, task, "created", {}, ready_since)
+        report = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end,
+        )
+    ready_holes = [h for h in report["holes"] if h["rule_id"] == "STALL.READY_UNCLAIMED"]
+    assert ready_holes == []
+
+
+def test_ready_unclaimed_suppressed_when_per_profile_capacity_full(board):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    cfg = {
+        "kanban": {
+            "max_in_progress_per_profile": 1,
+            "telemetry_hole_rules": {},
+        }
+    }
+    thr = telemetry.load_hole_rule_thresholds(cfg)
+    with kb.connect_closing() as conn:
+        running = kb.create_task(conn, title="busy", assignee="felix-steele")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (running,))
+        ready = kb.create_task(conn, title="waiting", assignee="felix-steele")
+        _insert_event(conn, ready, "created", {}, ready_since)
+        report = telemetry.run_review(
+            conn, board_slug="default", db_path=kb.kanban_db_path(),
+            window_end=end, generated_at=end, thresholds=thr, config=cfg,
+        )
+    assert not any(h["rule_id"] == "STALL.READY_UNCLAIMED" for h in report["holes"])
+
+
+def test_hole_rule_thresholds_default_from_config_and_override():
+    defaults = telemetry.load_hole_rule_thresholds({})
+    assert defaults["protocol_violation_repeat_threshold"] == telemetry.PROTOCOL_VIOLATION_REPEAT_THRESHOLD
+    assert defaults["retry_thrash_failure_threshold"] == telemetry.RETRY_THRASH_FAILURE_THRESHOLD
+    assert defaults["blocked_aged_medium_seconds"] == telemetry.BLOCKED_AGED_MEDIUM_SECONDS
+    assert defaults["blocked_aged_high_seconds"] == telemetry.BLOCKED_AGED_HIGH_SECONDS
+    assert defaults["blocked_aged_critical_seconds"] == telemetry.BLOCKED_AGED_CRITICAL_SECONDS
+    assert defaults["dispatch_tick_seconds"] == telemetry.DISPATCH_TICK_SECONDS
+    assert defaults["todo_promotable_threshold_seconds"] == 2 * defaults["dispatch_tick_seconds"]
+    assert defaults["ready_unclaimed_threshold_seconds"] == 2 * defaults["dispatch_tick_seconds"]
+    assert telemetry.RULE_SET_VERSION == "1.2.0"
+
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    cfg_defaults = DEFAULT_CONFIG["kanban"]["telemetry_hole_rules"]
+    assert cfg_defaults["protocol_violation_repeat_threshold"] == 2
+    assert cfg_defaults["retry_thrash_failure_threshold"] == 2
+
+    override = telemetry.load_hole_rule_thresholds({
+        "kanban": {
+            "dispatch_interval_seconds": 30,
+            "telemetry_hole_rules": {
+                "protocol_violation_repeat_threshold": 3,
+                "ready_unclaimed_threshold_seconds": 90,
+            },
+        }
+    })
+    assert override["dispatch_tick_seconds"] == 30
+    assert override["todo_promotable_threshold_seconds"] == 60
+    assert override["ready_unclaimed_threshold_seconds"] == 90
+    assert override["protocol_violation_repeat_threshold"] == 3
+
+
+def test_persist_review_replay_preserves_dispositioned_verified_ledger(board, tmp_path):
+    """AGA P1 #1: replaying a telemetry source must never reset the ledger.
+
+    Reproduces the exact rejected sequence: promote a telemetry finding,
+    disposition it accepted_queued, verify it, then replay the SAME
+    telemetry key through ``persist_review``. Under the old
+    ``INSERT OR REPLACE`` the replay deleted+reinserted the source row,
+    re-fired the promotion trigger, and nulled every disposition and
+    verification field while the events remained — state/event divergence
+    that reopened the orphan gate.
+    """
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="replay", triage=True)
+        _insert_event(conn, task, "intake_received", {"source_type": "paragraph", "source_ref_hash": "abc", "idempotency_key": "abc", "received_by": "haa"}, end - 4000)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        paths = telemetry.write_artifacts(report, tmp_path / "one")
+        telemetry.persist_review(conn, report, *paths)
+
+        promoted = [
+            hole["finding_key"]
+            for hole in report["holes"]
+            if hole["subject"].get("task_ids") == [task]
+        ]
+        assert promoted, "expected at least one task-scoped telemetry finding"
+        key = promoted[0]
+        assert kb.get_finding(conn, key) is not None
+
+        kb.disposition_finding(
+            conn,
+            finding_key=key,
+            disposition="accepted_queued",
+            linear_issue_id="HEL-3112",
+            actor_id="paul-park",
+        )
+        evidence = kb.fetch_linear_issue_evidence(
+            "HEL-3112",
+            transport=lambda _q, _v: {
+                "data": {
+                    "issue": {
+                        "id": "9a48515e-6535-4393-81e4-6fd6c7dc6023",
+                        "identifier": "HEL-3112",
+                        "state": {"name": "In Review"},
+                    }
+                }
+            },
+        )
+        kb.verify_finding(conn, key, actor_id="paul-park", evidence=evidence)
+
+        def ledger_row():
+            return conn.execute(
+                "SELECT * FROM findings WHERE finding_key = ?", (key,)
+            ).fetchone()
+
+        def finding_event_count():
+            return sum(
+                1
+                for event in kb.list_events(conn, task)
+                if event.payload
+                and event.payload.get("event_type", "").startswith("finding_")
+            )
+
+        def orphan_keys():
+            return {f.finding_key for f in kb.list_orphan_findings(conn)}
+
+        row_before = tuple(ledger_row())
+        # Trigger-promoted findings carry no finding_opened event (that event
+        # belongs to Python open_finding); lifecycle cardinality is 3:
+        # dispositioned, queued, verified.
+        assert finding_event_count() == 3
+        # Sibling holes from the same review remain (correctly) orphaned;
+        # the finding under test must have left the orphan gate.
+        orphans_before = orphan_keys()
+        assert key not in orphans_before
+
+        # Replay: same telemetry window persisted again (same finding_key).
+        replay = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end + 50)
+        replay_paths = telemetry.write_artifacts(replay, tmp_path / "two")
+        telemetry.persist_review(conn, replay, *replay_paths)
+
+        assert tuple(ledger_row()) == row_before
+        assert finding_event_count() == 3
+        # The replay must not reopen the gate for the verified finding nor
+        # change the orphan set at all.
+        assert orphan_keys() == orphans_before
+        assert key not in orphan_keys()
+        source_count = conn.execute(
+            "SELECT COUNT(*) FROM telemetry_review_findings WHERE finding_key = ?",
+            (key,),
+        ).fetchone()[0]
+    assert source_count == 1
+
+
+def test_persist_review_replay_updates_observation_fields_without_row_identity_loss(board, tmp_path):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="observe", triage=True)
+        _insert_event(conn, task, "intake_received", {"source_type": "paragraph", "source_ref_hash": "abc", "idempotency_key": "abc", "received_by": "haa"}, end - 4000)
+        first = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        telemetry.persist_review(conn, first, *telemetry.write_artifacts(first, tmp_path / "one"))
+        second = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end + telemetry.CADENCE_SECONDS, generated_at=end + telemetry.CADENCE_SECONDS)
+        telemetry.persist_review(conn, second, *telemetry.write_artifacts(second, tmp_path / "two"))
+        rows = conn.execute(
+            "SELECT finding_key, first_observed_at, last_observed_at, state "
+            "FROM telemetry_review_findings ORDER BY finding_key"
+        ).fetchall()
+    persisted = {row["finding_key"]: row for row in rows}
+    shared = [
+        hole["finding_key"]
+        for hole in second["holes"]
+        if hole["state"] == "PERSISTING" and hole["finding_key"] in persisted
+    ]
+    assert shared, "expected persisting findings across the two windows"
+    for key in shared:
+        row = persisted[key]
+        # Observation fields advanced monotonically on the SAME row.
+        assert row["state"] == "PERSISTING"
+        assert row["last_observed_at"] >= row["first_observed_at"]

@@ -161,3 +161,70 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
 # (landed via #28754 / #28781).  The original PR shipped a duplicate test
 # here; dropped during salvage to avoid two assertions of the same contract.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# consecutive_failures must be floored at the tripping effective_limit
+# (t_21f59f6d) — otherwise a same-tick re-resolution of a lower/unrelated
+# effective_limit under-reads the counter and undoes the trip immediately.
+# ---------------------------------------------------------------------------
+
+
+def test_force_trip_floors_consecutive_failures_at_effective_limit(
+    kanban_home: Path,
+) -> None:
+    """``_record_task_failure(force_trip=True)`` must persist
+    ``max(failures, effective_limit)`` on ``consecutive_failures``, not the
+    raw per-call ``failures`` count.
+
+    Bug shape (t_21f59f6d / t_d1994b5b / t_342c4c9f): a force-trip caller
+    (e.g. the protocol-violation streak) trips the breaker on a threshold
+    unrelated to the unified ``consecutive_failures`` column. If the column
+    was reset to 0 by a prior unblock, the very first force-trip call
+    computes ``failures=1`` even though it is tripping on, say,
+    ``failure_limit=3``. Storing that raw ``1`` let ``recompute_ready`` —
+    invoked later in the SAME dispatch tick with its own (often lower)
+    resolved ``effective_limit`` — see ``1 < effective_limit`` and
+    immediately promote the task back to ``ready``, undoing the trip and
+    producing an infinite blocked -> ready -> crash loop surfaced as a
+    ``promoted`` event with ``trigger=parents_terminal`` and
+    ``satisfied_parent_ids=[]`` on a zero-parent task.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="force-trip floor reproducer")
+        kb.claim_task(conn, tid)
+
+        # Force-trip with a higher threshold than the raw per-call
+        # ``failures`` count (starts at 0 -> 1 on this first call).
+        tripped = kb._record_task_failure(
+            conn, tid,
+            error="protocol violation streak",
+            outcome="crashed",
+            failure_limit=3,
+            force_trip=True,
+            release_claim=True,
+            end_run=True,
+        )
+        assert tripped is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        # The critical assertion: the stored counter must be floored at
+        # the effective_limit that tripped the breaker (3), not the raw
+        # per-call failures count (1).
+        assert task.consecutive_failures == 3, (
+            "consecutive_failures must be floored at effective_limit "
+            f"(3), got {task.consecutive_failures} — under-reporting "
+            "lets a later lower-limit recompute_ready call re-promote "
+            "the task within the same dispatch tick"
+        )
+
+        # Simulate the SAME dispatch tick re-resolving a lower/unrelated
+        # default failure_limit via recompute_ready. Before the fix, the
+        # under-reported counter (1) would satisfy `1 < 2` and promote
+        # the task straight back to ready.
+        promoted = kb.recompute_ready(conn, failure_limit=2)
+        assert promoted == 0, (
+            "task must NOT be re-promoted within the same tick when its "
+            "floored failure count still exceeds a lower effective_limit"
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
