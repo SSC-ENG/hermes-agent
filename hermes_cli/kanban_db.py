@@ -8475,6 +8475,9 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"terminal_loop_error"`` — ``WIFEXITED`` with status
+      ``KANBAN_TERMINAL_LOOP_EXIT_CODE``. Conversation loop terminal failure
+      (truncation give-up, etc.); see #17 auto-block path.
     * ``"forced_signal"`` — ``WIFEXITED`` with status in the shell signal
       range ``128 + N`` (e.g. 143 = SIGTERM). The kanban worker's SIGTERM
       handler intentionally exits this way so a reclaim / max-runtime kill
@@ -8487,8 +8490,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit`` / ``forced_signal``) or the signal number (for
-    ``signaled``), or ``None`` for ``unknown``.
+    ``terminal_loop_error`` / ``nonzero_exit`` / ``forced_signal``) or the
+    signal number (for ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -8501,6 +8504,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_TERMINAL_LOOP_EXIT_CODE:
+                return ("terminal_loop_error", code)
             # Shell/bash convention: 128 + signum. Worker SIGTERM handler
             # exits 143 so we never mislabel a forced kill as clean.
             if (
