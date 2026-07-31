@@ -5374,6 +5374,25 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _most_recent_event_kind(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the ``kind`` of the single most recent ``task_events`` row for
+    ``task_id``, or ``None`` if the task has no events.
+
+    Used to detect that a ``triage`` card landed there via the
+    ``block_loop_detected`` routing (see ``block_task`` /
+    ``BLOCK_RECURRENCE_LIMIT``) rather than via normal raw-intake — that
+    routing exists specifically to force a human decision, so callers such
+    as the auto-decomposer must not treat it as an ordinary triage card to
+    sweep and re-promote (t_e2b1f62a).
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row["kind"] if row else None
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -7125,12 +7144,44 @@ def block_task(
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
+        # re-block for the SAME reason after a prior *legitimate* unblock.
+        # block_task only fires from running/ready (i.e. AFTER something
+        # returned the task to the work pool), so a stored block_kind that
+        # matches the incoming kind COULD mean: blocked -> unblocked ->
+        # about-to-re-block for the same cause (Dale's genuine cron/human
+        # unblock <-> worker re-block ping-pong — this is what the counter is
+        # meant to catch). An un-typed (None) block compares as "same" to a
+        # prior un-typed block.
+        #
+        # But "blocked -> ready/running" can ALSO happen without anyone
+        # actually unblocking the task for a reason: ``recompute_ready``'s
+        # dispatcher-side ``parents_terminal`` sweep (or any other
+        # non-``unblock_task`` transition) can flip a non-sticky
+        # circuit-breaker ``blocked`` state back to ``ready`` on its own.
+        # That is a completely different signal from "a human/cron decided
+        # this was resolved" — treating it the same way conflates "re-promoted
+        # by dispatcher machinery unrelated to the block reason" with
+        # "re-blocked for the same cause after a legitimate unblock", and
+        # inflates ``block_recurrences`` on every dispatcher hiccup until the
+        # loop breaker trips and routes an otherwise-correctly-blocked,
+        # already-reviewed card to ``triage`` for no reason (t_e2b1f62a).
+        #
+        # Disambiguate by checking what the most recent "exit from blocked"
+        # event actually was: only an explicit ``unblock_task`` call emits
+        # ``"unblocked"``; a dispatcher auto-promotion emits ``"promoted"``
+        # (trigger ``parents_terminal`` or otherwise). Only count this as a
+        # same-cause re-block when the intervening exit was a genuine
+        # ``unblocked`` event.
+        last_exit_row = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? "
+            "AND kind IN ('unblocked', 'promoted') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        exited_via_legitimate_unblock = bool(
+            last_exit_row and last_exit_row["kind"] == "unblocked"
+        )
+        same_cause = prev_kind == kind and exited_via_legitimate_unblock
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:

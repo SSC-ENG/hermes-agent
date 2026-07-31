@@ -282,3 +282,40 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_skips_triage_card_from_block_loop_detected(kanban_home):
+    """A triage card whose most recent event is ``block_loop_detected`` was
+    routed there specifically to force a human decision (see
+    ``block_task``/``BLOCK_RECURRENCE_LIMIT`` in kanban_db.py — t_e2b1f62a).
+    ``decompose_task`` must refuse to auto-specify/promote it, and must not
+    invoke the auxiliary LLM at all for such a card.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review-required card", triage=True)
+        kb._append_event(
+            conn, tid, "block_loop_detected",
+            {"reason": "REJECTED-INTAKE", "kind": "needs_input",
+             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+        )
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client("{}") as mock_call_llm, _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "block_loop_detected" in outcome.reason
+    mock_call_llm.assert_not_called()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage", (
+        "a block_loop_detected card must stay in triage untouched, "
+        "not be re-specified or promoted"
+    )
+
+
+
