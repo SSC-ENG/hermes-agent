@@ -9567,6 +9567,29 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            #
+            # Persist a FLOOR of ``effective_limit`` on the stored counter,
+            # not the raw ``failures`` count. ``force_trip=True`` callers
+            # (protocol-violation streak, systemic crash fingerprint) trip
+            # on a threshold that has nothing to do with the unified
+            # ``consecutive_failures`` column — e.g. a violation streak of
+            # 3 force-trips with ``failure_limit=3`` while the column itself
+            # sat at 0 (reset by an earlier unblock), so ``failures`` here is
+            # only 1. Storing that raw ``1`` let ``recompute_ready`` — which
+            # runs later in the SAME dispatch tick and re-resolves its own
+            # (unrelated, often lower) effective_limit — see "1 < 2" and
+            # immediately promote the task straight back to ``ready``,
+            # undoing the trip within the same tick. Observed as an infinite
+            # blocked -> ready -> crash loop for zero-parent tasks (surfaced
+            # as `{"trigger": "parents_terminal", "satisfied_parent_ids":
+            # []}` since a zero-parent task's parent list is vacuously
+            # "all done"); t_d1994b5b hit this 96+ times. Flooring the
+            # stored value at the limit that actually tripped it makes any
+            # later re-check computing the same-or-lower limit correctly see
+            # the task as still over threshold; a genuinely higher configured
+            # limit can still recover it (unified counter semantics
+            # preserved, just no longer allowed to under-report).
+            stored_failures = max(failures, effective_limit)
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
@@ -9574,7 +9597,7 @@ def _record_task_failure(
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (stored_failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -9584,7 +9607,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (stored_failures, error[:500], task_id),
                 )
             run_id = None
             if end_run:
