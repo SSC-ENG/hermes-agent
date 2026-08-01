@@ -139,6 +139,17 @@ _GATEWAY_VERDICT_RE = re.compile(
 )
 # Legacy prose verdict tokens posted by reviewer authorities.
 _LEGACY_VERDICT_RE = re.compile(r"\b(?:PASS|GO|APPROVED)\b", re.IGNORECASE)
+# Link types on ``task_links.link_type``.
+#   * NULL / ``depends-on`` — hard dependency (parent must be done/archived).
+#   * ``gates`` — soft/gating link (review/verify/merge). Parent satisfies the
+#     child while parent is ``blocked`` or ``running`` as well as terminal.
+# Existing rows keep NULL and behave exactly as hard dependencies (AC-3).
+VALID_LINK_TYPES = {"depends-on", "gates"}
+GATES_LINK_TYPE = "gates"
+HARD_LINK_TYPES = {None, "depends-on"}
+# Parent statuses that satisfy a ``gates`` link (in addition to terminal).
+GATES_SATISFYING_PARENT_STATUSES = frozenset({"blocked", "running", "done", "archived"})
+TERMINAL_PARENT_STATUSES = frozenset({"done", "archived"})
 FINDING_DISPOSITIONS = frozenset({
     "accepted_queued",
     "accepted_existing",
@@ -1540,6 +1551,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
+    -- NULL = hard dependency (legacy / default). 'gates' = soft review/verify
+    -- link that does not deadlock the child while the parent is in flight.
+    link_type  TEXT,
     PRIMARY KEY (parent_id, child_id)
 );
 
@@ -3038,6 +3052,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    # task_links.link_type (HEL-3219): nullable. Existing rows stay NULL and
+    # keep hard-dependency semantics. Fresh SCHEMA_SQL already includes the
+    # column; this pass upgrades legacy boards that predate it.
+    links_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_links'"
+    ).fetchone()
+    if links_table_exists:
+        link_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_links)")
+        }
+        if "link_type" not in link_cols:
+            _add_column_if_missing(
+                conn, "task_links", "link_type", "link_type TEXT"
+            )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3457,6 +3486,73 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_link_type(link_type: Optional[str]) -> Optional[str]:
+    """Return a canonical ``task_links.link_type`` value or raise ValueError.
+
+    ``None`` / empty string → ``None`` (legacy hard dependency).
+    ``'depends-on'`` and ``'gates'`` are accepted as-is. Anything else is
+    rejected so callers cannot silently invent new semantics.
+    """
+    if link_type is None:
+        return None
+    value = str(link_type).strip()
+    if not value:
+        return None
+    if value not in VALID_LINK_TYPES:
+        raise ValueError(
+            f"link_type must be one of {sorted(VALID_LINK_TYPES)} or None, "
+            f"got {link_type!r}"
+        )
+    return value
+
+
+def _parent_satisfies_link(parent_status: str, link_type: Optional[str]) -> bool:
+    """Return True if a parent status satisfies a child link of ``link_type``.
+
+    Hard / NULL / ``depends-on`` links require the parent to be terminal
+    (``done`` or ``archived``). ``gates`` links also accept ``blocked`` and
+    ``running`` so a review/verify child can start while the work under
+    review is still in flight (HEL-3219).
+    """
+    if parent_status in TERMINAL_PARENT_STATUSES:
+        return True
+    if link_type == GATES_LINK_TYPE:
+        return parent_status in GATES_SATISFYING_PARENT_STATUSES
+    return False
+
+
+def _parents_satisfied_for_child(
+    conn: sqlite3.Connection, child_id: str
+) -> bool:
+    """True when every parent link of ``child_id`` is currently satisfied."""
+    rows = conn.execute(
+        "SELECT t.status AS status, l.link_type AS link_type "
+        "FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ?",
+        (child_id,),
+    ).fetchall()
+    return all(_parent_satisfies_link(r["status"], r["link_type"]) for r in rows)
+
+
+def _unsatisfied_parent_ids(
+    conn: sqlite3.Connection, child_id: str
+) -> list[str]:
+    """Return parent ids whose links do not currently satisfy the child."""
+    rows = conn.execute(
+        "SELECT t.id AS id, t.status AS status, l.link_type AS link_type "
+        "FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ?",
+        (child_id,),
+    ).fetchall()
+    return [
+        r["id"]
+        for r in rows
+        if not _parent_satisfies_link(r["status"], r["link_type"])
+    ]
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3470,6 +3566,7 @@ def create_task(
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
+    parent_link_type: Optional[str] = None,
     triage: bool = False,
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
@@ -3488,10 +3585,17 @@ def create_task(
     """Create a new task and optionally link it under parent tasks.
 
     Returns the new task id.  Status is ``ready`` when there are no
-    parents (or all parents already ``done``), otherwise ``todo``.
+    parents (or all parents already satisfy their links), otherwise
+    ``todo``. Hard/NULL links require parent ``done``; ``gates`` links
+    also accept parent ``blocked``/``running`` (HEL-3219).
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
+
+    ``parent_link_type`` is applied to every edge created from
+    ``parents`` (``None``/omitted = hard dependency; ``'gates'`` = soft
+    review/verify link). Prefer omitting the parent link entirely for
+    gating tasks when grouping is not required.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -3630,6 +3734,7 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    parent_link_type = _normalize_link_type(parent_link_type)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3735,13 +3840,21 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
+                        # If any parent does not satisfy its link, we're todo.
+                        # Hard/NULL links require done; gates links also accept
+                        # blocked/running (HEL-3219).
                         rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN "
+                            "SELECT id, status FROM tasks WHERE id IN "
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
+                        by_id = {r["id"]: r["status"] for r in rows}
+                        if any(
+                            not _parent_satisfies_link(
+                                by_id.get(pid, ""), parent_link_type
+                            )
+                            for pid in parents
+                        ):
                             task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
@@ -3806,8 +3919,9 @@ def create_task(
                 )
                 for pid in parents:
                     conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
+                        "INSERT OR IGNORE INTO task_links "
+                        "(parent_id, child_id, link_type) VALUES (?, ?, ?)",
+                        (pid, task_id, parent_link_type),
                     )
                 _append_event(
                     conn,
@@ -3817,6 +3931,7 @@ def create_task(
                         "assignee": assignee,
                         "status": task_status,
                         "parents": list(parents),
+                        "parent_link_type": parent_link_type,
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
@@ -4052,9 +4167,23 @@ def set_model_override(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    link_type: Optional[str] = None,
+) -> None:
+    """Link ``parent_id`` → ``child_id``.
+
+    ``link_type`` controls promotion semantics (HEL-3219):
+      * ``None`` / ``'depends-on'`` — hard dependency (default, legacy).
+      * ``'gates'`` — soft review/verify link; child may promote while the
+        parent is ``blocked`` or ``running``.
+    """
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    link_type = _normalize_link_type(link_type)
     with write_txn(conn):
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
@@ -4063,22 +4192,41 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
-        conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+        # Prefer updating link_type when the edge already exists so callers
+        # can reclassify a hard edge as gates (or vice versa) without an
+        # unlink/relink dance. INSERT OR IGNORE alone would leave a stale
+        # NULL type on re-link.
+        existing = conn.execute(
+            "SELECT link_type FROM task_links "
+            "WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
-        )
-        # If child was ready but parent is not yet done, demote child to todo.
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO task_links (parent_id, child_id, link_type) "
+                "VALUES (?, ?, ?)",
+                (parent_id, child_id, link_type),
+            )
+        else:
+            conn.execute(
+                "UPDATE task_links SET link_type = ? "
+                "WHERE parent_id = ? AND child_id = ?",
+                (link_type, parent_id, child_id),
+            )
+        # If child was ready but this parent does not satisfy the link,
+        # demote child to todo. Gates links stay ready while parent is
+        # blocked/running.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
-        if parent_status != "done":
+        if not _parent_satisfies_link(parent_status, link_type):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
         _append_event(
             conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
+            {"parent": parent_id, "child": child_id, "link_type": link_type},
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
 
@@ -5530,7 +5678,10 @@ def _most_recent_event_kind(conn: sqlite3.Connection, task_id: str) -> Optional[
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks to ``ready`` when all parent links are satisfied.
+
+    Hard/NULL links require parent ``done``/``archived``. ``gates`` links
+    also accept parent ``blocked``/``running`` (HEL-3219).
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -5588,12 +5739,16 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status AS status, l.link_type AS link_type "
+                "FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(
+                _parent_satisfies_link(p["status"], p["link_type"])
+                for p in parents
+            ):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -5656,19 +5811,15 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
-        # regardless of which writer (create_task, link_tasks, unblock_task,
-        # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
+        # parent link is unsatisfied. Hard/NULL links still require parent
+        # done/archived; gates links accept blocked/running (HEL-3219).
+        # This is the single enforcement point regardless of which writer
+        # (create_task, link_tasks, unblock_task, release_stale_claims,
+        # manual SQL) set status='ready'. If a racy writer promoted a task
+        # with unsatisfied parents, demote it back to 'todo' here —
+        # recompute_ready will re-promote when the parents actually finish.
+        # See RCA at kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        undone = _unsatisfied_parent_ids(conn, task_id)
         if undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -7459,16 +7610,7 @@ def promote_task(
         )
 
     if not force:
-        parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
-            (task_id,),
-        ).fetchall()
-        unsatisfied = [
-            p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
-        ]
+        unsatisfied = _unsatisfied_parent_ids(conn, task_id)
         if unsatisfied:
             return False, (
                 f"unsatisfied parent dependencies: "
@@ -7524,18 +7666,14 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
-        # 'ready'. Unconditionally setting status='ready' here bypasses the
-        # parent-completion invariant (the dispatcher trusts that column);
-        # if parents are still in progress the task must wait in 'todo'
-        # until recompute_ready picks it up. RCA: Bug 2 at
+        # Re-gate on parent-link satisfaction before flipping 'blocked' back
+        # to 'ready'. Unconditionally setting status='ready' here bypasses
+        # the parent-completion invariant (the dispatcher trusts that
+        # column); if hard parents are still in progress the task must wait
+        # in 'todo' until recompute_ready picks it up. Gates links accept
+        # blocked/running parents (HEL-3219). RCA: Bug 2 at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone_parents = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
-            (task_id,),
-        ).fetchone()
+        undone_parents = _unsatisfied_parent_ids(conn, task_id)
         new_status = "todo" if undone_parents else "ready"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly

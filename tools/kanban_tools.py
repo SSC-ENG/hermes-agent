@@ -1194,6 +1194,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    parent_link_type = args.get("parent_link_type") or args.get("link_type")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1214,6 +1215,7 @@ def _handle_create(args: dict, **kw) -> str:
                 body=body,
                 assignee=str(assignee),
                 parents=tuple(parents),
+                parent_link_type=parent_link_type,
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
@@ -1421,12 +1423,18 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
+    link_type = args.get("link_type")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
-            kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
-            return _ok(parent_id=parent_id, child_id=child_id)
+            kb.link_tasks(
+                conn,
+                parent_id=parent_id,
+                child_id=child_id,
+                link_type=link_type,
+            )
+            return _ok(parent_id=parent_id, child_id=child_id, link_type=link_type)
         finally:
             conn.close()
     except ValueError as e:
@@ -1862,10 +1870,25 @@ KANBAN_CREATE_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Parent task ids. The new task stays in 'todo' "
-                    "until every parent reaches 'done'; then it "
-                    "auto-promotes to 'ready'. Typical fan-in: list "
-                    "all the researcher task ids when creating a "
+                    "until every parent link is satisfied; then it "
+                    "auto-promotes to 'ready'. Hard/NULL links require "
+                    "parent 'done'; 'gates' links also accept parent "
+                    "'blocked'/'running' (HEL-3219). Typical fan-in: "
+                    "list all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "parent_link_type": {
+                "type": "string",
+                "enum": ["depends-on", "gates"],
+                "description": (
+                    "Link type applied to every edge created from "
+                    "parents. Omit / 'depends-on' = hard dependency "
+                    "(default). 'gates' = soft review/verify link so "
+                    "the child can promote while the parent is still "
+                    "blocked or running (HEL-3219). Prefer omitting "
+                    "the parent link entirely for gating tasks when "
+                    "grouping is not required."
                 ),
             },
             "tenant": {
@@ -2028,14 +2051,25 @@ KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
         "Add a parent→child dependency edge after both tasks already "
-        "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "exist. Hard/NULL links keep the child in 'todo' until parents "
+        "are 'done'; 'gates' links also accept parent 'blocked'/"
+        "'running' so review/verify children can start while work is "
+        "in flight (HEL-3219). Cycles and self-links are rejected."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
             "child_id":  {"type": "string", "description": "Child task id."},
+            "link_type": {
+                "type": "string",
+                "enum": ["depends-on", "gates"],
+                "description": (
+                    "Optional link type. Omit / 'depends-on' = hard "
+                    "dependency (default). 'gates' = soft review/"
+                    "verify link (HEL-3219)."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],
