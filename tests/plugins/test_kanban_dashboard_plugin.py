@@ -80,6 +80,93 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_dispatcher_health_endpoint_reports_missing_signal(client):
+    response = client.get("/api/plugins/kanban/dispatcher/health")
+
+    assert response.status_code == 200
+    assert response.json()["available"] is False
+    assert response.json()["stale"] is True
+    assert response.json()["signal"] is None
+
+
+def test_dispatcher_health_endpoint_exposes_persisted_actionable_signal(client):
+    now = int(time.time())
+    kb.write_dispatcher_health({
+        "schema_version": 1,
+        "updated_at": now,
+        "status": "actionable",
+        "actionable": True,
+        "consecutive_zero_spawn_ticks": 6,
+        "health_window": 6,
+        "dispatchable_count": 2,
+        "free_global_slots": 3,
+        "code": "dispatcher_zero_spawn_with_capacity",
+    })
+
+    response = client.get("/api/plugins/kanban/dispatcher/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is True
+    assert payload["stale"] is False
+    assert payload["signal"]["actionable"] is True
+    assert payload["signal"]["code"] == "dispatcher_zero_spawn_with_capacity"
+
+
+def test_dispatcher_health_endpoint_marks_old_signal_stale(client):
+    kb.write_dispatcher_health({
+        "schema_version": 1,
+        "updated_at": int(time.time()) - 601,
+        "status": "ok",
+    })
+
+    payload = client.get("/api/plugins/kanban/dispatcher/health").json()
+
+    assert payload["available"] is True
+    assert payload["stale"] is True
+    assert payload["age_seconds"] >= 601
+
+
+def test_dispatcher_health_endpoint_marks_degraded_signal_unavailable(client):
+    kb.write_dispatcher_health({
+        "schema_version": 1,
+        "updated_at": int(time.time()),
+        "status": "unavailable",
+        "degraded": True,
+        "probe_ok": False,
+        "probe_errors": [{"slug": "broken", "error": "DatabaseError"}],
+    })
+
+    payload = client.get("/api/plugins/kanban/dispatcher/health").json()
+
+    assert payload["available"] is False
+    assert payload["stale"] is False
+    assert payload["signal"]["probe_ok"] is False
+
+
+@pytest.mark.parametrize("updated_at", ["not-a-timestamp", None])
+def test_dispatcher_health_endpoint_marks_malformed_timestamp_stale(client, updated_at):
+    kb.write_dispatcher_health({"schema_version": 1, "updated_at": updated_at})
+
+    payload = client.get("/api/plugins/kanban/dispatcher/health").json()
+
+    assert payload["available"] is True
+    assert payload["stale"] is True
+    assert payload["age_seconds"] is None
+
+
+def test_dispatcher_health_endpoint_marks_unreadable_json_unavailable(client):
+    path = kb.dispatcher_health_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    payload = client.get("/api/plugins/kanban/dispatcher/health").json()
+
+    assert payload["available"] is False
+    assert payload["stale"] is True
+    assert payload["signal"] is None
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------

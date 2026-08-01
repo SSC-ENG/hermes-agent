@@ -240,3 +240,167 @@ def test_valid_candidate_is_claimed_and_spawned(kanban_home, monkeypatch):
     assert result.pre_dispatch_failed == []
     assert spawned == [task_id]
     assert task.status == "running"
+
+
+def _canonical_skill(home: Path, name: str, *, category: str = "helios-agents", frontmatter: str = "") -> Path:
+    """Install a golden skill package under the shared Hermes skills tree."""
+    package = home / "skills" / category / name
+    package.mkdir(parents=True, exist_ok=True)
+    package.joinpath("SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: canonical golden copy\n{frontmatter}---\n"
+        f"# Canonical {name}\n"
+        "Use this package to perform the assigned work safely, verify the result, "
+        "and report concrete evidence before completion.\n",
+        encoding="utf-8",
+    )
+    return package
+
+
+def test_missing_certification_skill_is_repaired_from_canonical(kanban_home, monkeypatch):
+    """Hollow/missing declared cert is installed from fleet golden copy; dispatch proceeds."""
+    profile = _profile(kanban_home)
+    # Remove the local certification package (simulates bianca-steele gap).
+    import shutil
+
+    shutil.rmtree(profile / "skills" / "worker-cert")
+    _canonical_skill(kanban_home, "worker-cert")
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db._resolve_hermes_argv",
+        lambda: ["python3", "-m", "hermes_cli.main"],
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="skill-sync repair",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+        )
+        spawned = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.pre_dispatch_failed == []
+    assert spawned == [task_id]
+    assert task is not None
+    assert task.status == "running"
+    repaired = profile / "skills" / "helios-agents" / "worker-cert" / "SKILL.md"
+    assert repaired.is_file()
+    assert "Canonical worker-cert" in repaired.read_text(encoding="utf-8")
+
+
+def test_hollow_skill_is_repaired_from_canonical(kanban_home, monkeypatch):
+    profile = _profile(kanban_home)
+    hollow = profile / "skills" / "worker-cert" / "SKILL.md"
+    hollow.write_text(
+        "---\nname: worker-cert\ndescription: hollow\n---\n# Empty\n",
+        encoding="utf-8",
+    )
+    _canonical_skill(kanban_home, "worker-cert")
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db._resolve_hermes_argv",
+        lambda: ["python3", "-m", "hermes_cli.main"],
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="hollow skill repair",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+        )
+        spawned = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.pre_dispatch_failed == []
+    assert spawned == [task_id]
+    assert task is not None
+    assert task.status == "running"
+    body = hollow.read_text(encoding="utf-8")
+    assert "Canonical worker-cert" in body
+
+
+def test_missing_skill_without_canonical_still_fails_closed(kanban_home, monkeypatch):
+    """No golden source anywhere → still missing_required_skill (no invented policy)."""
+    profile = _profile(kanban_home)
+    # Certificate present; task skill has no local or canonical package.
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db._resolve_hermes_argv",
+        lambda: ["python3", "-m", "hermes_cli.main"],
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="unknown skill fail-closed",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+            skills=["never-seen-ssc-cert"],
+        )
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert result.pre_dispatch_failed == [(task_id, "missing_required_skill")]
+    assert task is not None
+    assert task.status == "blocked"
+    assert not (profile / "skills" / "never-seen-ssc-cert").exists()
+    failure = next(
+        event for event in events if event.kind == "pre_dispatch_validation_failed"
+    )
+    assert failure.payload is not None
+    assert failure.payload["requirement"] == "never-seen-ssc-cert"
+
+
+def test_wrong_platform_skill_is_not_overwritten_by_sync(kanban_home, monkeypatch):
+    """Present wrong-platform packages are routing failures — not silently replaced."""
+    profile = _profile(kanban_home)
+    original = (
+        "---\nname: platform-bound\ndescription: local\nplatforms: [definitely-not-a-real-os]\n---\n"
+        "# Local platform-bound package\n"
+        "Use this package to perform the assigned work safely, verify the result, "
+        "and report concrete evidence before completion.\n"
+    )
+    skill_dir = profile / "skills" / "platform-bound"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(original, encoding="utf-8")
+    # Golden would "fix" platform if installed — must not clobber the local copy.
+    _canonical_skill(
+        kanban_home,
+        "platform-bound",
+        frontmatter="",  # no platforms → all platforms
+    )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db._resolve_hermes_argv",
+        lambda: ["python3", "-m", "hermes_cli.main"],
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="wrong platform no overwrite",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+            skills=["platform-bound"],
+        )
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert result.pre_dispatch_failed == [(task_id, "wrong_node_platform")]
+    assert task is not None
+    assert task.status == "blocked"
+    assert skill_path.read_text(encoding="utf-8") == original
+    failure = next(
+        event for event in events if event.kind == "pre_dispatch_validation_failed"
+    )
+    assert failure.payload is not None
+    assert failure.payload["action"] == "route_to_eligible_node"

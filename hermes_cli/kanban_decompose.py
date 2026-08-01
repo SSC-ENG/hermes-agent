@@ -570,11 +570,29 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
-    if task is None:
-        return DecomposeOutcome(task_id, False, "unknown task id")
-    if task.status != "triage":
+        if task is None:
+            return DecomposeOutcome(task_id, False, "unknown task id")
+        if task.status != "triage":
+            return DecomposeOutcome(
+                task_id, False, f"task is not in triage (status={task.status!r})"
+            )
+        # A triage card whose most recent event is ``block_loop_detected`` was
+        # routed here specifically to force a HUMAN decision (see
+        # ``block_task``/``BLOCK_RECURRENCE_LIMIT`` in kanban_db.py) — the
+        # unblock<->reblock loop breaker tripped because a worker kept
+        # re-blocking it for the same cause. Blindly re-"specifying" and
+        # promoting such a card back to ``todo``/``ready`` hands it straight
+        # back into the same loop the breaker exists to interrupt (t_e2b1f62a):
+        # the card's disposition is already correct and signed, it just needs a
+        # human triage call, not another decomposer pass. Skip it here; a human
+        # (or an explicit ``kanban specify``/``kanban promote`` call) is the
+        # only legitimate way out of this state.
+        most_recent_kind = kb._most_recent_event_kind(conn, task_id)
+    if most_recent_kind == "block_loop_detected":
         return DecomposeOutcome(
-            task_id, False, f"task is not in triage (status={task.status!r})"
+            task_id, False,
+            "skipped: most recent event is block_loop_detected — "
+            "awaiting human triage decision, not auto-decompose",
         )
 
     cfg = _load_config()

@@ -288,6 +288,14 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Exit status a kanban worker uses when a forced shut-down signal arrives
+# (SIGTERM from the dispatcher reclaim/max-runtime path, or any external
+# kill). Bash convention is ``128 + signum`` (143 for SIGTERM). The worker
+# CLI deliberately exits with this code from ``_signal_handler_q`` so the
+# reaper can classify the exit as a forced kill rather than a clean
+# ``protocol_violation`` (rc=0 with no terminal kanban tool call).
+KANBAN_FORCED_SIGNAL_EXIT_BASE = 128
+
 # Exit code a kanban worker uses when the conversation loop ends in a terminal
 # (non-success) state — truncation give-up, partial stream exhaustion, or an
 # unrecoverable loop error — and the worker either:
@@ -650,6 +658,39 @@ def current_board_path() -> Path:
     by default (meaning: active board is ``default``).
     """
     return kanban_home() / "kanban" / "current"
+
+
+def dispatcher_health_path() -> Path:
+    """Return the machine-readable embedded-dispatcher health file path."""
+    return kanban_home() / "kanban" / "dispatcher-health.json"
+
+
+def read_dispatcher_health() -> Optional[dict[str, Any]]:
+    """Read the last persisted dispatcher health snapshot, if valid."""
+    path = dispatcher_health_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def write_dispatcher_health(payload: Mapping[str, Any]) -> None:
+    """Atomically persist the embedded dispatcher's latest health snapshot."""
+    path = dispatcher_health_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(dict(payload), sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def get_current_board() -> str:
@@ -5366,6 +5407,25 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _most_recent_event_kind(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the ``kind`` of the single most recent ``task_events`` row for
+    ``task_id``, or ``None`` if the task has no events.
+
+    Used to detect that a ``triage`` card landed there via the
+    ``block_loop_detected`` routing (see ``block_task`` /
+    ``BLOCK_RECURRENCE_LIMIT``) rather than via normal raw-intake — that
+    routing exists specifically to force a human decision, so callers such
+    as the auto-decomposer must not treat it as an ordinary triage card to
+    sweep and re-promote (t_e2b1f62a).
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row["kind"] if row else None
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -5871,6 +5931,27 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+        # Count the reclaim against the unified failure counter so repeated
+        # stale-TTL reclaims trip the circuit breaker (HEL-3135). Timeout /
+        # crash paths already funnel here; without this call a task can loop
+        # ready→running→reclaimed forever while consecutive_failures stays
+        # at 0. Outside the write_txn because _record_task_failure opens its
+        # own. Manual reclaim_task is operator-driven and stays uncounted.
+        if cur.rowcount == 1:
+            _record_task_failure(
+                conn, row["id"],
+                error=f"stale_lock={row['claim_lock']}",
+                outcome="reclaimed",
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "heartbeat_stale": bool(heartbeat_stale),
+                },
+            )
     return reclaimed
 
 
@@ -7096,12 +7177,44 @@ def block_task(
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
+        # re-block for the SAME reason after a prior *legitimate* unblock.
+        # block_task only fires from running/ready (i.e. AFTER something
+        # returned the task to the work pool), so a stored block_kind that
+        # matches the incoming kind COULD mean: blocked -> unblocked ->
+        # about-to-re-block for the same cause (Dale's genuine cron/human
+        # unblock <-> worker re-block ping-pong — this is what the counter is
+        # meant to catch). An un-typed (None) block compares as "same" to a
+        # prior un-typed block.
+        #
+        # But "blocked -> ready/running" can ALSO happen without anyone
+        # actually unblocking the task for a reason: ``recompute_ready``'s
+        # dispatcher-side ``parents_terminal`` sweep (or any other
+        # non-``unblock_task`` transition) can flip a non-sticky
+        # circuit-breaker ``blocked`` state back to ``ready`` on its own.
+        # That is a completely different signal from "a human/cron decided
+        # this was resolved" — treating it the same way conflates "re-promoted
+        # by dispatcher machinery unrelated to the block reason" with
+        # "re-blocked for the same cause after a legitimate unblock", and
+        # inflates ``block_recurrences`` on every dispatcher hiccup until the
+        # loop breaker trips and routes an otherwise-correctly-blocked,
+        # already-reviewed card to ``triage`` for no reason (t_e2b1f62a).
+        #
+        # Disambiguate by checking what the most recent "exit from blocked"
+        # event actually was: only an explicit ``unblock_task`` call emits
+        # ``"unblocked"``; a dispatcher auto-promotion emits ``"promoted"``
+        # (trigger ``parents_terminal`` or otherwise). Only count this as a
+        # same-cause re-block when the intervening exit was a genuine
+        # ``unblocked`` event.
+        last_exit_row = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? "
+            "AND kind IN ('unblocked', 'promoted') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        exited_via_legitimate_unblock = bool(
+            last_exit_row and last_exit_row["kind"] == "unblocked"
+        )
+        same_cause = prev_kind == kind and exited_via_legitimate_unblock
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
@@ -8148,6 +8261,25 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+def _is_os_agnostic_absolute(raw: str) -> bool:
+    """Return True if ``raw`` is an absolute path under *any* mainstream OS.
+
+    ``pathlib.Path.is_absolute()`` is OS-dependent: a POSIX-style path like
+    ``/Users/dan/repo`` (no drive letter) is absolute on POSIX but NOT on
+    Windows, where ``WindowsPath('/Users/...').is_absolute()`` returns False.
+    In a mixed-host dispatch fleet (Mac authors the task, a Windows
+    control-plane host resolves the workspace) that mismatch raised a false
+    "non-absolute workspace_path" error and killed every dir: task on spawn.
+
+    We accept a path as absolute if EITHER interpretation says so:
+    POSIX (leading ``/``) or Windows (drive-letter / UNC). This validates the
+    author's intent regardless of which OS runs the resolver.
+    """
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    return PurePosixPath(raw).is_absolute() or PureWindowsPath(raw).is_absolute()
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -8181,7 +8313,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
             # same absolute-path guard as dir: — consistent with the
             # threat model.
             p = Path(task.workspace_path).expanduser()
-            if not p.is_absolute():
+            if not _is_os_agnostic_absolute(task.workspace_path):
                 raise ValueError(
                     f"task {task.id} has non-absolute workspace_path "
                     f"{task.workspace_path!r}; workspace paths must be absolute"
@@ -8196,7 +8328,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"task {task.id} has workspace_kind=dir but no workspace_path"
             )
         p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
+        if not _is_os_agnostic_absolute(task.workspace_path):
             raise ValueError(
                 f"task {task.id} has non-absolute workspace_path "
                 f"{task.workspace_path!r}; use an absolute path "
@@ -8323,7 +8455,7 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
-_RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
+_RESPAWN_GUARD_PR_WINDOW = 3600  # 1 hour (HAA 2026-07-29 option B: the prior 24h window suppressed 12/16 ready tasks because merge-lane work posts PR URLs constantly; combined with the code-task scoping in check_respawn_guard this keeps duplicate-PR protection without starving the board)
 
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
@@ -8432,6 +8564,94 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+# ---------------------------------------------------------------------------
+# Worker-log startup/billing failure signatures (truthful spawn telemetry)
+# ---------------------------------------------------------------------------
+#
+# When a worker dies at startup (bad skill pin, missing profile) or bails on
+# a provider billing wall, the OS-level exit status alone produces opaque
+# noise ("pid exited with code 1", or worse, a clean rc=0 that gets
+# mis-scored as a protocol violation). These signatures let
+# ``detect_crashed_workers`` read the tail of the per-task worker log and
+# classify the failure loudly + actionably instead.
+#
+# Each entry: (error_code, compiled_pattern, message_template).
+# ``{match}`` in the template is replaced with the first matching log line.
+_WORKER_LOG_FAILURE_SIGNATURES: "list[tuple[str, re.Pattern, str]]" = [
+    (
+        "billing_exhausted",
+        re.compile(
+            r"(?:HTTP[\s_-]*)?\b402\b"
+            r"|insufficient(?:[\s_]available)?[\s_]credits"
+            r"|insufficient_quota"
+            r"|exceeded your current quota"
+            r"|billing hard limit",
+            re.IGNORECASE,
+        ),
+        "provider credits exhausted (billing wall): {match}. "
+        "Requeued without counting a failure — add credits or remap the "
+        "assignee profile to a model with balance; the respawn guard will "
+        "pace retries until then.",
+    ),
+    (
+        "unknown_skill",
+        re.compile(r"Unknown skill\(s\)[^\n]*", re.IGNORECASE),
+        "worker startup failed: {match}. The task pins skill(s) that are not "
+        "installed on the assignee profile — install the skill on that "
+        "profile, or re-create the task without the bad skill pin.",
+    ),
+    (
+        "missing_profile",
+        re.compile(r"Profile '[^']+' does not exist[^\n]*"),
+        "worker startup failed: {match}. Create that Hermes profile or "
+        "reassign the task to an installed profile.",
+    ),
+]
+
+# How much of the worker log tail to scan for failure signatures. Startup
+# failures print within the first/last couple hundred bytes; 8 KiB is a
+# comfortable margin without paging megabytes on every dead-pid check.
+_WORKER_LOG_CLASSIFY_TAIL_BYTES = 8192
+
+
+def _classify_worker_failure_from_log(
+    task_id: str, *, board: Optional[str] = None,
+    min_mtime: Optional[float] = None,
+) -> "Optional[tuple[str, str]]":
+    """Scan the tail of a dead worker's log for a known failure signature.
+
+    Returns ``(error_code, detail_message)`` for the first matching
+    signature, or ``None`` when the log is missing/unreadable or matches
+    nothing. Never raises — this is best-effort enrichment; the caller
+    falls back to the OS-level exit classification.
+
+    ``min_mtime`` guards against stale evidence: worker logs are opened in
+    append mode across runs, so the tail can still contain a PRIOR run's
+    failure lines. When set, a log whose mtime predates ``min_mtime``
+    (typically the current run's ``started_at``) is ignored — nothing was
+    written during this run, so its tail proves nothing about this death.
+    """
+    try:
+        path = worker_log_path(task_id, board=board)
+        if not path.exists():
+            return None
+        if min_mtime is not None and path.stat().st_mtime < float(min_mtime):
+            return None
+        tail = read_worker_log(
+            task_id, tail_bytes=_WORKER_LOG_CLASSIFY_TAIL_BYTES, board=board,
+        )
+    except Exception:
+        return None
+    if not tail:
+        return None
+    for code, pattern, template in _WORKER_LOG_FAILURE_SIGNATURES:
+        m = pattern.search(tail)
+        if m:
+            match_line = m.group(0).strip()[:200]
+            return (code, template.format(match=match_line))
+    return None
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -8447,11 +8667,13 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
     * ``"terminal_loop_error"`` — ``WIFEXITED`` with status
-      ``KANBAN_TERMINAL_LOOP_EXIT_CODE``. The worker's conversation loop
-      ended without completion (truncation give-up, etc.). Prefer that the
-      worker already wrote a ``kanban_block`` before exiting; if the task
-      is still ``running`` this is still a hard failure (auto-block) but the
-      error text names the *loop error*, not a bare protocol violation.
+      ``KANBAN_TERMINAL_LOOP_EXIT_CODE``. Conversation loop terminal failure
+      (truncation give-up, etc.); see #17 auto-block path.
+    * ``"forced_signal"`` — ``WIFEXITED`` with status in the shell signal
+      range ``128 + N`` (e.g. 143 = SIGTERM). The kanban worker's SIGTERM
+      handler intentionally exits this way so a reclaim / max-runtime kill
+      is distinguishable from a genuine clean exit. Mapped as a signaled
+      crash (not a protocol violation).
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -8459,8 +8681,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``terminal_loop_error`` / ``nonzero_exit``) or the signal number (for
-    ``signaled``), or ``None`` for ``unknown``.
+    ``terminal_loop_error`` / ``nonzero_exit`` / ``forced_signal``) or the
+    signal number (for ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -8475,6 +8697,14 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("rate_limited", code)
             if code == KANBAN_TERMINAL_LOOP_EXIT_CODE:
                 return ("terminal_loop_error", code)
+            # Shell/bash convention: 128 + signum. Worker SIGTERM handler
+            # exits 143 so we never mislabel a forced kill as clean.
+            if (
+                KANBAN_FORCED_SIGNAL_EXIT_BASE
+                < code
+                <= KANBAN_FORCED_SIGNAL_EXIT_BASE + 64
+            ):
+                return ("forced_signal", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -8975,14 +9205,15 @@ def detect_stale_running(
             }
             payload.update(termination)
 
+            error = (
+                f"no heartbeat for {int(hb_age)}s "
+                if hb_age is not None
+                else "no heartbeat ever"
+            ) + f" after {int(elapsed)}s running"
             run_id = _end_run(
                 conn, tid,
                 outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
+                error=error,
                 metadata=payload,
             )
             _append_event(
@@ -8990,15 +9221,31 @@ def detect_stale_running(
             )
             reclaimed.append(tid)
 
-        # Intentionally NOT calling _record_task_failure here. Stale reclaim
-        # is dispatcher-side detection of an absent heartbeat; the task is
-        # going straight back to ``ready`` for re-dispatch. Counting it as
-        # a worker failure would let two legitimately-long-running tasks
-        # (>4h without explicit heartbeat) trip the circuit breaker and
-        # auto-block, even though no worker actually failed. The 'stale'
-        # event already lives in task_events for auditability; that's the
-        # right surface for "this happened" without conflating with the
-        # spawn_failed / timed_out / crashed counters.
+        # Count the reclaim against the unified failure counter so repeated
+        # no-heartbeat stale reclaims trip the circuit breaker (HEL-3135).
+        # Previously this path requeued to `ready` without touching
+        # consecutive_failures, which let a single stuck card re-dispatch
+        # dozens of times (production incident: t_8cea8385 ×65). Long-running
+        # legitimate work should heartbeat; the heartbeat mandate is the
+        # protection against false trips, not skipping the counter. Pattern
+        # matches enforce_max_runtime: call outside write_txn because
+        # _record_task_failure opens its own; on trip it flips ready→blocked
+        # and emits `gave_up` on top of the `stale` event already recorded.
+        if cur.rowcount == 1:
+            _record_task_failure(
+                conn, tid,
+                error=error,
+                outcome="stale",
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={
+                    "elapsed_seconds": int(elapsed),
+                    "heartbeat_age_seconds": (
+                        int(hb_age) if hb_age is not None else None
+                    ),
+                    "pid": int(pid) if pid else None,
+                },
+            )
 
     return reclaimed
 
@@ -9085,7 +9332,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -9149,9 +9398,44 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            # Enrich the OS-level exit status with evidence from the worker
+            # log tail: a 402/billing wall, a bad skill pin, or a missing
+            # profile all leave a distinctive line in the log while the exit
+            # status alone is opaque (rc=1, or a clean rc=0 that would be
+            # mis-scored as a protocol violation — incident 2026-07-30
+            # t_543dce5d: 12 consecutive 402s recorded as violations).
+            log_class = _classify_worker_failure_from_log(
+                row["id"], board=board,
+                min_mtime=(
+                    float(started_at) if started_at is not None else None
+                ),
+            )
+            log_error_code = log_class[0] if log_class else None
+            log_error_detail = log_class[1] if log_class else None
             rate_limited_exit = False
             force_block = False
-            if kind == "clean_exit":
+            if log_error_code == "billing_exhausted":
+                # Billing/credit exhaustion is a provider wall, not a task
+                # failure — same disposition as the EX_TEMPFAIL sentinel:
+                # requeue WITHOUT counting a failure so the breaker can't
+                # trip, and stamp a quota-flavored error so
+                # ``check_respawn_guard`` paces retries. This applies even
+                # when the worker exited rc=0 (it never got a model
+                # response, so there was nothing to complete or block).
+                protocol_violation = False
+                rate_limited_exit = True
+                error_text = (
+                    f"pid {pid} died on a provider billing wall — "
+                    f"{log_error_detail}"
+                )
+                event_kind = "rate_limited"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "error_code": "billing_exhausted",
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -9228,6 +9512,26 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
+                elif kind == "forced_signal":
+                    # rc = 128+signum (e.g. 143 = bash SIGTERM). Worker was
+                    # force-killed (reclaim, max_runtime, external SIGTERM) and
+                    # deliberately reported a non-zero status so we do NOT
+                    # count it as a clean-exit protocol_violation.
+                    sig = (
+                        int(code) - KANBAN_FORCED_SIGNAL_EXIT_BASE
+                        if code is not None else None
+                    )
+                    if sig == 15:
+                        error_text = (
+                            f"pid {pid} force-killed (SIGTERM, exit {code}) "
+                            f"— not a protocol violation"
+                        )
+                    else:
+                        error_text = (
+                            f"pid {pid} force-killed "
+                            f"(signal {sig}, exit {code}) "
+                            f"— not a protocol violation"
+                        )
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
@@ -9235,6 +9539,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+                    if kind == "forced_signal":
+                        event_payload["forced_kill"] = True
+                        event_payload["signal"] = (
+                            int(code) - KANBAN_FORCED_SIGNAL_EXIT_BASE
+                        )
+                # Loud classification for startup failures: a bad skill pin
+                # or a missing assignee profile crashes the worker pre-flight
+                # with an otherwise-opaque "pid exited with code 1". Attach
+                # the actionable detail from the worker log so the run row,
+                # events, and retry-worker context all say what actually
+                # broke and what to do about it.
+                if log_error_code in ("unknown_skill", "missing_profile"):
+                    error_text = f"{error_text}: {log_error_detail}"
+                    event_payload["error_code"] = log_error_code
+                    event_payload["error_detail"] = log_error_detail
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -9417,8 +9736,8 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
-    """Record a non-success outcome (spawn_failed / crashed / timed_out)
-    and maybe trip the circuit breaker.
+    """Record a non-success outcome (spawn_failed / crashed / timed_out /
+    reclaimed / stale) and maybe trip the circuit breaker.
 
     Unified replacement for the old spawn-only ``_record_spawn_failure``.
     Every path that ends a task with a non-success outcome funnels
@@ -9486,6 +9805,29 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            #
+            # Persist a FLOOR of ``effective_limit`` on the stored counter,
+            # not the raw ``failures`` count. ``force_trip=True`` callers
+            # (protocol-violation streak, systemic crash fingerprint) trip
+            # on a threshold that has nothing to do with the unified
+            # ``consecutive_failures`` column — e.g. a violation streak of
+            # 3 force-trips with ``failure_limit=3`` while the column itself
+            # sat at 0 (reset by an earlier unblock), so ``failures`` here is
+            # only 1. Storing that raw ``1`` let ``recompute_ready`` — which
+            # runs later in the SAME dispatch tick and re-resolves its own
+            # (unrelated, often lower) effective_limit — see "1 < 2" and
+            # immediately promote the task straight back to ``ready``,
+            # undoing the trip within the same tick. Observed as an infinite
+            # blocked -> ready -> crash loop for zero-parent tasks (surfaced
+            # as `{"trigger": "parents_terminal", "satisfied_parent_ids":
+            # []}` since a zero-parent task's parent list is vacuously
+            # "all done"); t_d1994b5b hit this 96+ times. Flooring the
+            # stored value at the limit that actually tripped it makes any
+            # later re-check computing the same-or-lower limit correctly see
+            # the task as still over threshold; a genuinely higher configured
+            # limit can still recover it (unified counter semantics
+            # preserved, just no longer allowed to under-report).
+            stored_failures = max(failures, effective_limit)
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
@@ -9493,7 +9835,7 @@ def _record_task_failure(
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (stored_failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -9503,7 +9845,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (stored_failures, error[:500], task_id),
                 )
             run_id = None
             if end_run:
@@ -9695,6 +10037,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed when an explicit re-queue event arrives after the latest
+        matching PR comment, because that event deliberately requests more
+        work even though the task already has PR evidence.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9777,12 +10122,46 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # Restrict this to code/PR-producing tasks. Evidence-reconciliation and
+    # research tasks commonly cite PR URLs but use a dir workspace with no
+    # branch; suppressing those tasks creates a false duplicate-PR signal.
+    task_shape = conn.execute(
+        "SELECT workspace_kind, branch_name FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    code_task = bool(
+        task_shape
+        and (
+            task_shape["workspace_kind"] == "worktree"
+            or (task_shape["branch_name"] or "").strip()
+        )
+    )
+    if not code_task:
+        return None
+    #    As with recent_success, an explicit re-queue AFTER the latest matching
+    #    PR comment is a deliberate request to continue work. A re-queue before
+    #    that comment does not bypass the guard: the newer PR evidence wins.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_comment_at = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? "
+        "ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            latest_pr_comment_at = int(c["created_at"])
+            break
+
+    if latest_pr_comment_at is not None:
+        requeued_after = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at > ? "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "LIMIT 1",
+            (task_id, latest_pr_comment_at),
+        ).fetchone()
+        if not requeued_after:
             return "active_pr"
 
     return None
@@ -9843,6 +10222,86 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         if profile_exists(row["assignee"]):
             return True
     return False
+
+
+def dispatcher_capacity_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> dict[str, Any]:
+    """Describe spawnable work while honoring dispatcher guardrails."""
+    running_count = int(
+        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+    )
+    caps = [
+        cap for cap in (max_spawn, max_in_progress)
+        if isinstance(cap, int) and cap > 0
+    ]
+    global_cap = min(caps) if caps else None
+    free_global_slots = (
+        None if global_cap is None else max(0, global_cap - running_count)
+    )
+    snapshot: dict[str, Any] = {
+        "running_count": running_count,
+        "global_cap": global_cap,
+        "free_global_slots": free_global_slots,
+        "dispatchable_count": 0,
+        "dispatchable_task_ids": [],
+    }
+    if free_global_slots == 0:
+        return snapshot
+
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+    per_profile_cap = (
+        max_in_progress_per_profile
+        if isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+        else None
+    )
+    per_profile_running: dict[str, int] = {}
+    if per_profile_cap is not None:
+        per_profile_running = {
+            row["assignee"]: int(row["n"])
+            for row in conn.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL "
+                "GROUP BY assignee"
+            )
+        }
+
+    candidates: list[str] = []
+    rows = conn.execute(
+        "SELECT id, status, assignee FROM tasks "
+        "WHERE status IN ('ready', 'review') AND assignee IS NOT NULL "
+        "AND claim_lock IS NULL "
+        "ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, "
+        "priority DESC, created_at ASC"
+    ).fetchall()
+    for row in rows:
+        assignee = row["assignee"]
+        if profile_exists is not None and not profile_exists(assignee):
+            continue
+        if (
+            per_profile_cap is not None
+            and per_profile_running.get(assignee, 0) >= per_profile_cap
+        ):
+            continue
+        if row["status"] == "ready":
+            if check_respawn_guard(conn, row["id"]) is not None:
+                continue
+        candidates.append(row["id"])
+        if per_profile_cap is not None:
+            per_profile_running[assignee] = per_profile_running.get(assignee, 0) + 1
+    if free_global_slots is not None:
+        candidates = candidates[:free_global_slots]
+    snapshot["dispatchable_count"] = len(candidates)
+    snapshot["dispatchable_task_ids"] = candidates
+    return snapshot
 
 
 def dispatch_once(
@@ -9966,7 +10425,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -10343,6 +10802,8 @@ def _dispatch_once_locked(
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if max_in_progress is not None and running_count + spawned >= max_in_progress:
+            break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -10372,8 +10833,19 @@ def _dispatch_once_locked(
         candidate = get_task(conn, row["id"])
         if candidate is None or not validate_pre_dispatch(candidate):
             continue
+        if _per_profile_cap is not None:
+            current = _per_profile_running.get(row["assignee"], 0)
+            if current >= _per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], row["assignee"], current)
+                )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            if _per_profile_cap is not None:
+                _per_profile_running[row["assignee"]] = (
+                    _per_profile_running.get(row["assignee"], 0) + 1
+                )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -10433,6 +10905,10 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if _per_profile_cap is not None and claimed.assignee:
+                _per_profile_running[claimed.assignee] = (
+                    _per_profile_running.get(claimed.assignee, 0) + 1
+                )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),

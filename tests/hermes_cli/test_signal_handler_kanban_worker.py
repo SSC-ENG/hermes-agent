@@ -11,9 +11,11 @@ dispatcher's ``_pid_alive`` check returns True forever, and the task stays
 ``running`` indefinitely.
 
 The fix: when the process is a dispatcher-spawned worker (``HERMES_KANBAN_TASK``
-env var set), flush logging + stdout/stderr and call ``os._exit(0)`` instead.
-The kernel reclaims the PID immediately, and ``detect_crashed_workers``
-reclaims the stale claim on the next dispatcher tick.
+env var set), flush logging + stdout/stderr and call ``os._exit(128+signum)``
+(143 for SIGTERM) instead of raising ``KeyboardInterrupt``. The kernel
+reclaims the PID immediately, and ``detect_crashed_workers`` reclaims the
+stale claim on the next dispatcher tick as a *forced kill*, not as a
+clean-exit protocol_violation (rc=0).
 
 These tests use a synthetic Python script that mirrors the cli.py signal
 handler shape so we can exercise the exit-path contract without booting the
@@ -57,15 +59,17 @@ def _synthetic_worker_script() -> str:
             except Exception:
                 pass
             if os.environ.get("HERMES_KANBAN_TASK"):
+                # 128+signum (143 for SIGTERM) — distinguishable from clean rc=0.
+                rc = 128 + int(signum) if isinstance(signum, int) and signum > 0 else 143
                 try:
                     if hasattr(signal, "SIGALRM"):
-                        signal.signal(signal.SIGALRM, lambda *_: os._exit(0))
+                        signal.signal(signal.SIGALRM, lambda *_: os._exit(rc))
                         signal.alarm(2)
                 except Exception:
                     pass
                 sys.stdout.flush()
                 sys.stderr.flush()
-                os._exit(0)
+                os._exit(rc)
             raise KeyboardInterrupt()
 
         signal.signal(signal.SIGTERM, handler)
@@ -160,19 +164,26 @@ def _cleanup(proc: subprocess.Popen) -> None:
 )
 def test_sigterm_with_kanban_task_env_terminates_quickly():
     """With HERMES_KANBAN_TASK set, SIGTERM should kill the process in <2s
-    even when a non-daemon thread is still alive."""
+    even when a non-daemon thread is still alive, exiting 143 (not 0)."""
     proc = _spawn_synthetic({"HERMES_KANBAN_TASK": "t_test_28181"})
     try:
         t0 = time.time()
         os.kill(proc.pid, signal.SIGTERM)
 
-        # Should die in <2s. The handler sleeps ~50ms, then os._exit(0)
+        # Should die in <2s. The handler sleeps ~50ms, then os._exit(143)
         # is immediate. Give generous headroom for slow CI runners.
         deadline = t0 + 2.0
         while time.time() < deadline:
             if not _is_alive_like_dispatcher(proc.pid):
                 elapsed = time.time() - t0
                 assert elapsed < 2.0
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+                assert proc.returncode == 143, (
+                    f"expected exit 143 (128+SIGTERM), got {proc.returncode}"
+                )
                 return
             time.sleep(0.02)
         pytest.fail(
@@ -214,5 +225,3 @@ def test_sigterm_without_kanban_task_env_uses_keyboard_interrupt_path():
             pass
     finally:
         _cleanup(proc)
-
-
