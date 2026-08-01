@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -23,6 +24,64 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+DISPATCHER_HEALTH_WINDOW = 6
+
+
+def _persist_dispatcher_health(
+    write_fn: Callable[[dict[str, Any]], None],
+    snapshot: dict[str, Any],
+) -> bool:
+    """Best-effort telemetry write; dispatch outcomes must never depend on it."""
+    try:
+        write_fn(snapshot)
+    except Exception:
+        logger.debug("kanban dispatcher: health persistence failed", exc_info=True)
+        return False
+    return True
+
+
+def _next_dispatcher_health(
+    previous_bad_ticks: int,
+    *,
+    any_spawned: bool,
+    capacity: dict[str, Any],
+    now: int,
+) -> tuple[int, dict[str, Any]]:
+    """Advance the sustained zero-spawn health window by one tick."""
+    probe_ok = bool(capacity.get("probe_ok", True))
+    dispatchable = int(capacity.get("dispatchable_count") or 0)
+    free_global_slots = capacity.get("free_global_slots")
+    if probe_ok and dispatchable > 0 and not any_spawned and free_global_slots != 0:
+        bad_ticks = previous_bad_ticks + 1
+    elif probe_ok:
+        bad_ticks = 0
+    else:
+        # Probe failure is not evidence of healthy idle capacity, and must not
+        # erase an already sustained condition.
+        bad_ticks = previous_bad_ticks
+    actionable = bad_ticks >= DISPATCHER_HEALTH_WINDOW
+    return bad_ticks, {
+        "schema_version": 1,
+        "updated_at": int(now),
+        "status": "actionable" if actionable else ("unavailable" if not probe_ok else "ok"),
+        "actionable": actionable,
+        "consecutive_zero_spawn_ticks": bad_ticks,
+        "health_window": DISPATCHER_HEALTH_WINDOW,
+        "dispatchable_count": dispatchable,
+        "free_global_slots": free_global_slots,
+        "running_count": int(capacity.get("running_count") or 0),
+        "boards": capacity.get("boards") or [],
+        "probe_ok": probe_ok,
+        "probe_errors": capacity.get("probe_errors") or [],
+        "degraded": not probe_ok,
+        "code": "dispatcher_zero_spawn_with_capacity" if actionable else None,
+        "recommended_action": (
+            "Check profile runtime health, PATH, credentials, and the ready queue."
+            if actionable
+            else None
+        ),
+    }
 
 
 def _resolve_auto_decompose_settings(
@@ -1152,9 +1211,14 @@ class GatewayKanbanWatchersMixin:
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
         # queue is non-empty but spawns are 0 for N consecutive ticks —
         # usually means broken PATH, missing venv, or credential loss.
-        HEALTH_WINDOW = 6
+        HEALTH_WINDOW = DISPATCHER_HEALTH_WINDOW
         bad_ticks = 0
         last_warn_at = 0
+
+        def _persist_health(snapshot: dict[str, Any]) -> None:
+            """Persist health without allowing telemetry to stop dispatch."""
+            _persist_dispatcher_health(_kb.write_dispatcher_health, snapshot)
+
         last_telemetry_review_boundary: int | None = None
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
@@ -1296,40 +1360,72 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+        def _dispatcher_capacity(
+            results: list[tuple[str, Optional[object]]],
+            *,
+            max_spawn: Optional[int],
+            max_in_progress: Optional[int],
+            max_in_progress_per_profile: Optional[int],
+        ) -> dict[str, Any]:
+            """Aggregate actionable dispatch capacity across all boards.
 
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
+            Probes every board unconditionally, regardless of whether that
+            board's dispatch tick just succeeded, failed, or was skipped
+            (e.g. quarantined corrupt DB) — mirrors the pre-refactor
+            ``_ready_nonempty()`` probe, which never gated its own connect
+            attempt on the dispatch tick's outcome. Health telemetry is
+            most valuable on exactly the boards where dispatch is failing,
+            so skipping the probe there would blind the signal it exists
+            to catch.
             """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
+            boards: list[dict[str, Any]] = []
+            total_dispatchable = 0
+            total_free_slots = 0
+            total_running = 0
+            unlimited_capacity = False
+            probe_errors: list[dict[str, str]] = []
+            for slug, _result in results or []:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _kb.has_spawnable_review(conn):
-                        return True
-                except Exception:
-                    continue
+                    snapshot = _kb.dispatcher_capacity_snapshot(
+                        conn,
+                        max_spawn=max_spawn,
+                        max_in_progress=max_in_progress,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                    )
+                    boards.append({"slug": slug, **snapshot})
+                    total_dispatchable += int(snapshot["dispatchable_count"])
+                    total_running += int(snapshot["running_count"])
+                    free = snapshot["free_global_slots"]
+                    if free is None:
+                        unlimited_capacity = True
+                    else:
+                        total_free_slots += int(free)
+                except Exception as exc:
+                    probe_errors.append({"slug": slug, "error": type(exc).__name__})
+                    logger.debug(
+                        "kanban dispatcher: capacity probe failed on board %s",
+                        slug,
+                        exc_info=True,
+                    )
                 finally:
                     if conn is not None:
                         try:
                             conn.close()
                         except Exception:
                             pass
-            return False
+            return {
+                "dispatchable_count": total_dispatchable,
+                "free_global_slots": (
+                    None if unlimited_capacity or not boards else total_free_slots
+                ),
+                "running_count": total_running,
+                "boards": boards,
+                "probe_ok": not probe_errors and bool(results),
+                "probe_errors": probe_errors,
+                "degraded": bool(probe_errors) or not results,
+            }
 
         def _telemetry_review_tick() -> None:
             """Run one persisted review cycle for every active board."""
@@ -1492,12 +1588,24 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
-                # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
-                    bad_ticks += 1
-                else:
-                    bad_ticks = 0
+                # Health telemetry (aggregate across boards). Only flag a
+                # sustained condition when there is real spawnable work AND
+                # there is global headroom. Nonspawnable assignees,
+                # active-PR guards, and per-profile caps are correctly idle.
+                capacity = await asyncio.to_thread(
+                    _dispatcher_capacity,
+                    results,
+                    max_spawn=max_spawn,
+                    max_in_progress=max_in_progress,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                )
+                bad_ticks, health_snapshot = _next_dispatcher_health(
+                    bad_ticks,
+                    any_spawned=any_spawned,
+                    capacity=capacity,
+                    now=int(time.time()),
+                )
+                _persist_health(health_snapshot)
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:

@@ -2652,6 +2652,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
+            ],
+            "rate_limited": res.rate_limited,
+            "skipped_locked": res.skipped_locked,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2689,6 +2695,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Dispatch failed (missing assignee profile; create it or reassign): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.respawn_guarded:
+        for tid, reason in res.respawn_guarded:
+            print(f"Respawn guarded ({reason}): {tid}")
+    if res.rate_limited:
+        print(
+            f"Rate-limited / billing wall (requeued, no failure counted): "
+            f"{', '.join(res.rate_limited)}"
+        )
+    if res.skipped_locked:
+        print("Tick skipped: another dispatcher holds the board lock.")
     return 0
 
 
