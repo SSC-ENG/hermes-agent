@@ -7904,6 +7904,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Exception, mirroring ``"recent_success"``: an explicit re-queue
+        event (status change, promote, unblock, reclaim) arriving AFTER
+        that PR-URL comment is a deliberate signal that the PR needs
+        further work (e.g. a TRC HOLD verdict followed by ``unblock``) —
+        honor it instead of holding the task hostage to its own PR link
+        for up to 24h (#kanban-active-pr-unblock-deadlock, t_75be53fc).
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7986,13 +7992,28 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Bypassed the same way as `recent_success`: an explicit re-queue
+    #    event (status, promoted, unblocked, reclaimed) arriving AFTER the
+    #    PR-URL comment means someone deliberately sent this task back for
+    #    more work on that PR (e.g. TRC posts a HOLD verdict quoting the
+    #    PR URL, then calls `unblock`) — without this check the guard reads
+    #    its own PR link and holds the task for the full 24h window even
+    #    though a human/reviewer explicitly asked for another pass.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            requeued_after_pr = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND created_at >= ? "
+                "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+                "LIMIT 1",
+                (task_id, c["created_at"]),
+            ).fetchone()
+            if not requeued_after_pr:
+                return "active_pr"
 
     return None
 

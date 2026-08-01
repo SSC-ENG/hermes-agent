@@ -320,6 +320,50 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
 
 
+def test_respawn_guard_active_pr_bypassed_by_requeue_after_pr_comment(
+    kanban_home, monkeypatch,
+):
+    """A GitHub PR URL in a comment holds the task (``active_pr``) — but an
+    explicit re-queue event (e.g. ``unblock_task``) arriving AFTER that
+    comment must bypass the guard, mirroring the existing ``recent_success``
+    exception. Regression for t_75be53fc / t_c4460024 (OLC-411 PR#831): a
+    worker posted a PR-URL comment, a reviewer then posted a HOLD verdict and
+    called ``unblock``, and the guard held the task hostage to its own PR
+    link for the full 24h window instead of honoring the deliberate
+    re-queue.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    now = 8_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pr-guard", assignee="a")
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now)
+        kb.add_comment(
+            conn, tid, "worker",
+            "PR ready: https://github.com/acme/repo/pull/831",
+        )
+
+        # No re-queue yet — the guard should hold.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 60)
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+        # Reviewer posts a HOLD verdict (another comment, doesn't matter)
+        # and explicitly unblocks the task — a deliberate re-queue signal
+        # arriving strictly after the PR-URL comment.
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,)
+        )
+        conn.commit()
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 90)
+        assert kb.unblock_task(conn, tid) is True
+
+        # The guard must now let the respawn through.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 120)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
