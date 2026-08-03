@@ -1857,10 +1857,12 @@ def test_dispatcher_capacity_excludes_nonspawnable_guarded_and_profile_capped(
     kanban_home, monkeypatch
 ):
     from hermes_cli import profiles
+    import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(
         profiles, "profile_exists", lambda name: name in {"busy", "free"},
     )
+    monkeypatch.setattr(_kb, "_resolve_pr_open_state", lambda o, r, n: True)
     with kb.connect() as conn:
         nonspawnable = kb.create_task(conn, title="terminal", assignee="orion-cc")
         capped = kb.create_task(conn, title="busy-ready", assignee="busy")
@@ -2143,7 +2145,10 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+    """A GitHub PR URL in a recent comment triggers active_pr when the PR's
+    live state resolves to OPEN."""
+    import hermes_cli.kanban_db as _kb
+
     with kb.connect() as conn:
         t = kb.create_task(
             conn, title="has-pr", assignee="alice", workspace_kind="worktree"
@@ -2152,8 +2157,145 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
             conn, t, "worker",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
-        reason = kb.check_respawn_guard(conn, t)
+        with unittest.mock.patch.object(
+            _kb, "_resolve_pr_open_state", return_value=True,
+        ):
+            reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
+
+
+def test_respawn_guard_merged_pr_in_comment_does_not_guard(kanban_home):
+    """A GitHub PR URL in a comment does NOT guard once that PR's live
+    state resolves to MERGED/CLOSED — the guard is state-aware, not
+    text-aware (t_edd7abd5)."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="has-merged-pr", assignee="alice", workspace_kind="worktree"
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        with unittest.mock.patch.object(
+            _kb, "_resolve_pr_open_state", return_value=False,
+        ) as mock_resolve:
+            reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+    mock_resolve.assert_called_once_with("totemx-AI", "subsidysmart", "42")
+
+
+def test_respawn_guard_unresolvable_pr_state_fails_closed(kanban_home):
+    """When PR state can't be resolved (gh missing/unauthenticated/network
+    error), the guard fails CLOSED — matching the old conservative default
+    when nothing about the PR can be verified."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="unresolvable-pr", assignee="alice", workspace_kind="worktree"
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        with unittest.mock.patch.object(
+            _kb, "_resolve_pr_open_state", return_value=None,
+        ):
+            reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_merged_pr_cited_by_non_worker_author_does_not_guard(
+    kanban_home,
+):
+    """A merged PR URL cited by a non-worker author (orchestrator,
+    reviewer) must not freeze the card either. The guard's correctness
+    signal is live PR state, not who typed the URL into a comment — the
+    observed incident (t_edd7abd5) was exactly an orchestrator citing
+    already-merged PR links as context, not a worker's own
+    duplicate-PR-risk comment."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="orchestrator-cited-pr", assignee="alice",
+            workspace_kind="worktree",
+        )
+        kb.add_comment(
+            conn, t, "orchestrator",
+            "For context, this satisfied "
+            "https://github.com/totemx-AI/subsidysmart/pull/42 which already merged.",
+        )
+        with unittest.mock.patch.object(
+            _kb, "_resolve_pr_open_state", return_value=False,
+        ):
+            reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_resolve_pr_open_state_parses_gh_api_state(monkeypatch):
+    """Unit-level check of the gh api parsing logic: 'open' -> True,
+    'closed' -> False (GitHub reports merged PRs as state=closed too —
+    both non-open states must clear the guard), unparseable output -> None
+    (unknown, fail closed at the caller)."""
+    import hermes_cli.kanban_db as _kb
+
+    _kb._pr_state_cache.clear()
+
+    def _fake_run_open(argv, **kwargs):
+        assert argv[:2] == ["gh", "api"]
+        assert argv[2] == "repos/acme/open-repo/pulls/1"
+        return subprocess.CompletedProcess(argv, 0, stdout="open\n", stderr="")
+
+    monkeypatch.setattr(_kb.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(_kb.subprocess, "run", _fake_run_open)
+    assert _kb._resolve_pr_open_state("acme", "open-repo", "1") is True
+
+    _kb._pr_state_cache.clear()
+    monkeypatch.setattr(
+        _kb.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="closed\n", stderr=""),
+    )
+    assert _kb._resolve_pr_open_state("acme", "closed-repo", "2") is False
+
+    _kb._pr_state_cache.clear()
+    monkeypatch.setattr(
+        _kb.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found"),
+    )
+    assert _kb._resolve_pr_open_state("acme", "missing-repo", "3") is None
+
+
+def test_resolve_pr_open_state_caches_within_ttl(monkeypatch):
+    """Repeated lookups for the same PR within the cache TTL must not
+    shell out to `gh` again — a hot dispatch loop checking the same cited
+    PR every tick shouldn't hammer the GitHub API."""
+    import hermes_cli.kanban_db as _kb
+
+    _kb._pr_state_cache.clear()
+    calls = {"n": 0}
+
+    def _fake_run(argv, **kwargs):
+        calls["n"] += 1
+        return subprocess.CompletedProcess(argv, 0, stdout="open\n", stderr="")
+
+    monkeypatch.setattr(_kb.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(_kb.subprocess, "run", _fake_run)
+    monkeypatch.setattr(_kb.time, "monotonic", lambda: 1000.0)
+
+    assert _kb._resolve_pr_open_state("acme", "repo", "42") is True
+    assert _kb._resolve_pr_open_state("acme", "repo", "42") is True
+    assert calls["n"] == 1
+
+    # Past the TTL, it re-resolves.
+    monkeypatch.setattr(
+        _kb.time, "monotonic",
+        lambda: 1000.0 + _kb._RESPAWN_GUARD_PR_STATE_CACHE_TTL + 1,
+    )
+    assert _kb._resolve_pr_open_state("acme", "repo", "42") is True
+    assert calls["n"] == 2
 
 
 def test_respawn_guard_ignores_pr_evidence_on_dir_task_without_branch(kanban_home):
@@ -2258,7 +2400,10 @@ def test_dispatch_respawn_guard_skips_recent_success(
 def test_dispatch_respawn_guard_skips_active_pr(
     kanban_home, all_assignees_spawnable, tmp_path
 ):
-    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    """dispatch_once skips (but does not block) a task with an active
+    (OPEN) PR comment."""
+    import hermes_cli.kanban_db as _kb
+
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -2275,7 +2420,10 @@ def test_dispatch_respawn_guard_skips_active_pr(
             conn, t, "worker",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        with unittest.mock.patch.object(
+            _kb, "_resolve_pr_open_state", return_value=True,
+        ):
+            res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert (t, "active_pr") in res.respawn_guarded
     assert t not in spawned_ids

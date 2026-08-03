@@ -8454,14 +8454,88 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Within this window a GitHub PR URL in a comment blocks re-spawn.
+# Within this window a GitHub PR URL in a comment blocks re-spawn — but ONLY
+# when that PR's live state, resolved via ``gh api``, is OPEN (t_edd7abd5:
+# the guard used to be purely textual and froze dispatch on ANY PR URL
+# mention including a link to a PR that had already merged/closed).
 _RESPAWN_GUARD_PR_WINDOW = 3600  # 1 hour (HAA 2026-07-29 option B: the prior 24h window suppressed 12/16 ready tasks because merge-lane work posts PR URLs constantly; combined with the code-task scoping in check_respawn_guard this keeps duplicate-PR protection without starving the board)
 
-# Pattern matching a GitHub PR URL in task comments.
+# Pattern matching a GitHub PR URL in task comments. Captures owner/repo/
+# number so the guard can resolve LIVE state via ``gh api`` instead of
+# trusting the mere presence of a URL string.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<number>\d+)",
     re.IGNORECASE,
 )
+
+# TTL for the in-process PR-state cache used by _resolve_pr_open_state().
+# Caching avoids hitting the GitHub API on every dispatch tick for the same
+# cited PR while staying short enough that a just-merged PR clears the
+# guard within one cache generation rather than waiting out the full
+# _RESPAWN_GUARD_PR_WINDOW.
+_RESPAWN_GUARD_PR_STATE_CACHE_TTL = 300  # 5 minutes
+
+# (owner.lower(), repo.lower(), number) -> (is_open_or_None, resolved_at_monotonic)
+_pr_state_cache: dict[tuple[str, str, int], tuple[Optional[bool], float]] = {}
+_pr_state_cache_lock = threading.Lock()
+
+
+def _resolve_pr_open_state(owner: str, repo: str, number: "str | int") -> Optional[bool]:
+    """Return True if the PR is OPEN, False if MERGED/CLOSED, None if unknown.
+
+    Backed by ``gh api`` — reuses whatever ``gh`` auth (keyring or
+    ``GH_TOKEN``) the host already has; no separate credential wiring.
+    Results are cached in-process for ``_RESPAWN_GUARD_PR_STATE_CACHE_TTL``
+    seconds so a hot dispatch loop doesn't hammer the GitHub API re-checking
+    the same PR every tick.
+
+    Returns ``None`` (unknown) on any failure — ``gh`` missing,
+    unauthenticated, network error, rate limit, non-200, or a malformed
+    response — so the caller can fail closed exactly as the old text-only
+    guard did whenever live state genuinely can't be established.
+    """
+    try:
+        num = int(number)
+    except (TypeError, ValueError):
+        return None
+    key = (owner.lower(), repo.lower(), num)
+    now = time.monotonic()
+    with _pr_state_cache_lock:
+        cached = _pr_state_cache.get(key)
+        if cached is not None and (now - cached[1]) < _RESPAWN_GUARD_PR_STATE_CACHE_TTL:
+            return cached[0]
+
+    state: Optional[bool] = None
+    if shutil.which("gh"):
+        try:
+            proc = subprocess.run(
+                [
+                    "gh", "api",
+                    f"repos/{owner}/{repo}/pulls/{num}",
+                    "--jq", ".state",
+                ],
+                capture_output=True, text=True, timeout=10,
+                stdin=subprocess.DEVNULL,
+                env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+                check=False,
+            )
+            if proc.returncode == 0:
+                raw_state = (proc.stdout or "").strip().lower()
+                if raw_state == "open":
+                    state = True
+                elif raw_state == "closed":
+                    # GitHub reports merged PRs as state=closed (with a
+                    # separate `merged` boolean) — either way it is not
+                    # "active" for respawn-guard purposes.
+                    state = False
+                # Any other/empty value (deleted repo, 404 body, etc.) is
+                # left as None — unknown, fail closed.
+        except (OSError, subprocess.SubprocessError):
+            state = None
+
+    with _pr_state_cache_lock:
+        _pr_state_cache[key] = (state, now)
+    return state
 
 
 @dataclass
@@ -10035,11 +10109,25 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
-        Bypassed when an explicit re-queue event arrives after the latest
-        matching PR comment, because that event deliberately requests more
-        work even though the task already has PR evidence.
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds) AND that PR's live state,
+        resolved via ``gh api``, is OPEN. A prior worker already opened a
+        PR that is still under review; re-spawning risks a duplicate PR on
+        the same task. Bypassed when an explicit re-queue event arrives
+        after the latest matching PR comment, because that event
+        deliberately requests more work even though the task already has
+        PR evidence.
+
+        This guard is deliberately STATE-AWARE, not just text-aware
+        (t_edd7abd5): a PR URL that has since MERGED or been CLOSED does
+        NOT hold the guard, no matter how many comments cite it or how
+        recently — citing a PR link as context (a status update, an
+        orchestrator summary, a reviewer's verdict quoting the link) must
+        never be indistinguishable from "a worker just opened a duplicate
+        PR". Only a *live-resolved* OPEN state holds the respawn. When the
+        PR's state can't be resolved at all (``gh`` missing/
+        unauthenticated, network error, malformed URL) the guard fails
+        CLOSED exactly as the old text-only check did — unknown state
+        still defers the respawn rather than risking a duplicate PR.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -10121,10 +10209,15 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    # Restrict this to code/PR-producing tasks. Evidence-reconciliation and
-    # research tasks commonly cite PR URLs but use a dir workspace with no
-    # branch; suppressing those tasks creates a false duplicate-PR signal.
+    # 4. GitHub PR URL in a recent comment — prior worker already opened a
+    #    PR, but only guard while that PR is still OPEN. Comments are prose
+    #    cited by anyone (a worker, an orchestrator, a reviewer quoting the
+    #    link in a verdict) — the mere presence of the URL string is not
+    #    itself evidence of an active duplicate-PR risk; live PR state is.
+    #    Restrict this to code/PR-producing tasks. Evidence-reconciliation
+    #    and research tasks commonly cite PR URLs but use a dir workspace
+    #    with no branch; suppressing those tasks creates a false
+    #    duplicate-PR signal.
     task_shape = conn.execute(
         "SELECT workspace_kind, branch_name FROM tasks WHERE id = ?",
         (task_id,),
@@ -10138,9 +10231,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     )
     if not code_task:
         return None
-    #    As with recent_success, an explicit re-queue AFTER the latest matching
-    #    PR comment is a deliberate request to continue work. A re-queue before
-    #    that comment does not bypass the guard: the newer PR evidence wins.
+    #    As with recent_success, an explicit re-queue AFTER the latest
+    #    matching (state-active) PR comment is a deliberate request to
+    #    continue work. A re-queue before that comment does not bypass the
+    #    guard: the newer PR evidence wins.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     latest_pr_comment_at = None
     for c in conn.execute(
@@ -10149,8 +10243,20 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         "ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            latest_pr_comment_at = int(c["created_at"])
+        if not c["body"]:
+            continue
+        for m in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"]):
+            is_open = _resolve_pr_open_state(
+                m.group("owner"), m.group("repo"), m.group("number")
+            )
+            if is_open is not False:
+                # True (confirmed OPEN) or None (unresolvable — fail
+                # closed, same as the pre-fix behavior) both count as
+                # active PR evidence. Only a confirmed False
+                # (MERGED/CLOSED) is skipped.
+                latest_pr_comment_at = int(c["created_at"])
+                break
+        if latest_pr_comment_at is not None:
             break
 
     if latest_pr_comment_at is not None:
