@@ -680,6 +680,13 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.MissingDispositionError as disp_err:
+                return tool_error(
+                    f"kanban_complete blocked: BEL card requires a disposition "
+                    f"tag (TRUE_BLOCK | LINKED_FIX_PENDING | UNBLOCKED) in "
+                    f"summary/result or metadata.disposition. {disp_err} "
+                    f"Task is still in-flight (no state change). Retry with a tag."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
