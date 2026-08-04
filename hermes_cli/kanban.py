@@ -2415,32 +2415,42 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except ValueError as exc:
+                # Source gate (t_25dd3612) and kind validation raise ValueError
+                # with an actionable message — surface cleanly, no traceback.
+                failed.append(tid)
+                print(f"cannot block {tid}: {exc}", file=sys.stderr)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
+                continue
+            # Comment only after a successful transition so a rejected gate
+            # does not leave a false "BLOCKED:" trail on the card.
+            if reason:
+                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            # Report where the task actually landed — dependency blocks go
+            # to todo, and a tripped unblock-loop breaker routes to triage.
+            landed = kb.get_task(conn, tid)
+            where = landed.status if landed else "blocked"
+            suffix = f": {reason}" if reason else ""
+            if where == "todo":
+                print(f"{tid} → todo (dependency wait){suffix}")
+            elif where == "triage":
+                print(
+                    f"{tid} → triage (unblock loop detected — needs a "
+                    f"human decision){suffix}"
+                )
             else:
-                # Report where the task actually landed — dependency blocks go
-                # to todo, and a tripped unblock-loop breaker routes to triage.
-                landed = kb.get_task(conn, tid)
-                where = landed.status if landed else "blocked"
-                suffix = f": {reason}" if reason else ""
-                if where == "todo":
-                    print(f"{tid} → todo (dependency wait){suffix}")
-                elif where == "triage":
-                    print(
-                        f"{tid} → triage (unblock loop detected — needs a "
-                        f"human decision){suffix}"
-                    )
-                else:
-                    print(f"Blocked {tid}{suffix}")
+                print(f"Blocked {tid}{suffix}")
     return 0 if not failed else 1
 
 
