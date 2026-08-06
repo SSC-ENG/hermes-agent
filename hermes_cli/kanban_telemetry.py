@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -10,6 +11,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 RULE_SET_VERSION = "1.2.0"
 REVIEW_WINDOW_SECONDS = 48 * 60 * 60
@@ -1001,8 +1004,21 @@ def run_scheduled_review(
 def run_scheduled_reviews(
     *,
     now: Optional[int] = None,
+    skip_slugs: Optional[set[str]] = None,
 ) -> list[tuple[str, dict[str, Any], Path, Path]]:
-    """Run one deterministic cycle for every active board."""
+    """Run one deterministic cycle for every active board.
+
+    Per-board isolation (HEL-3113 follow-up): a corrupt board DB must not
+    abort review for its siblings, nor spam a full traceback into the
+    dispatcher watcher's generic ``logger.exception``. Boards the dispatcher
+    already quarantined this tick (``skip_slugs``) are skipped up front
+    without even attempting to open them — no point re-discovering the same
+    corruption the dispatcher just classified. Any board that fails during
+    its own review is classified with :func:`kb.is_corrupt_db_error`; a
+    corrupt board logs one line and is skipped, a genuinely unexpected error
+    still gets ``logger.exception`` (we want that traceback) but scoped to
+    this one board so later boards in iteration order still run.
+    """
     from hermes_cli import kanban_db as kb
 
     end = nominal_window_end(now)
@@ -1013,11 +1029,32 @@ def run_scheduled_reviews(
         boards = [kb.read_board_metadata(kb.DEFAULT_BOARD)]
     for board in boards:
         slug = board.get("slug") or kb.DEFAULT_BOARD
-        report, json_path, markdown_path = run_scheduled_review(
-            board_slug=slug,
-            window_end=end,
-            generated_at=now,
-        )
+        if skip_slugs and slug in skip_slugs:
+            logger.info(
+                "kanban telemetry review [%s]: skipped — already quarantined "
+                "by dispatch this tick",
+                slug,
+            )
+            continue
+        try:
+            report, json_path, markdown_path = run_scheduled_review(
+                board_slug=slug,
+                window_end=end,
+                generated_at=now,
+            )
+        except Exception as exc:
+            if kb.is_corrupt_db_error(exc):
+                logger.error(
+                    "kanban telemetry review [%s]: skipping corrupt board "
+                    "database (%s); healthy boards continue on schedule",
+                    slug,
+                    exc,
+                )
+            else:
+                logger.exception(
+                    "kanban telemetry review [%s]: review cycle failed", slug,
+                )
+            continue
         results.append((slug, report, json_path, markdown_path))
     return results
 
