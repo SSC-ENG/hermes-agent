@@ -571,6 +571,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
     p_link.add_argument("child_id")
+    p_link.add_argument(
+        "--type",
+        dest="link_type",
+        choices=["depends-on", "gates"],
+        default=None,
+        help=(
+            "Link type (HEL-3219). Default hard dependency. "
+            "'gates' allows the child to promote while the parent is "
+            "blocked or running."
+        ),
+    )
     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
@@ -2147,8 +2158,15 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 def _cmd_link(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        kb.link_tasks(conn, args.parent_id, args.child_id)
-    print(f"Linked {args.parent_id} -> {args.child_id}")
+        kb.link_tasks(
+            conn,
+            args.parent_id,
+            args.child_id,
+            link_type=getattr(args, "link_type", None),
+        )
+    lt = getattr(args, "link_type", None)
+    suffix = f" type={lt}" if lt else ""
+    print(f"Linked {args.parent_id} -> {args.child_id}{suffix}")
     return 0
 
 
