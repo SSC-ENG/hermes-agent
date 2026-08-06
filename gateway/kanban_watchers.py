@@ -1242,6 +1242,9 @@ class GatewayKanbanWatchersMixin:
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
             corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
+            classify = getattr(_kb, "is_corrupt_db_error", None)
+            if classify is not None:
+                return bool(classify(exc))
             if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
                 return True
             if not isinstance(exc, sqlite3.DatabaseError):
@@ -1428,10 +1431,19 @@ class GatewayKanbanWatchersMixin:
             }
 
         def _telemetry_review_tick() -> None:
-            """Run one persisted review cycle for every active board."""
+            """Run one persisted review cycle for every active board.
+
+            Boards the dispatcher already quarantined this tick as corrupt
+            (``disabled_corrupt_boards``) are passed through as
+            ``skip_slugs`` so the review cadence doesn't redundantly
+            rediscover the same corruption on its own connect attempt.
+            """
             from hermes_cli import kanban_telemetry as _telemetry
 
-            results = _telemetry.run_scheduled_reviews(now=int(time.time()))
+            skip_slugs = set(disabled_corrupt_boards.keys())
+            results = _telemetry.run_scheduled_reviews(
+                now=int(time.time()), skip_slugs=skip_slugs,
+            )
             for slug, report, json_path, markdown_path in results:
                 logger.info(
                     "kanban telemetry review [%s]: status=%s holes=%d json=%s markdown=%s",

@@ -2083,6 +2083,26 @@ def _validate_sqlite_header(path: Path) -> None:
     )
 
 
+def is_corrupt_db_error(exc: Exception) -> bool:
+    """Classify whether ``exc`` indicates an unreadable/corrupt board DB file.
+
+    Single source of truth for "is this a corrupt-board-file error" so every
+    caller (gateway dispatcher, telemetry review cadence, future callers)
+    agrees on the same classification instead of drifting copies. Matches
+    :class:`KanbanDbCorruptError` (our own fail-closed guard) plus the two
+    raw sqlite3 message shapes that surface corruption before our guard runs.
+    """
+    if isinstance(exc, KanbanDbCorruptError):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return (
+        "file is not a database" in msg
+        or "database disk image is malformed" in msg
+    )
+
+
 class KanbanDbCorruptError(RuntimeError):
     """Raised when an existing kanban DB file fails integrity checks.
 
