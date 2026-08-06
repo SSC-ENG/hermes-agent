@@ -5657,14 +5657,19 @@ def _setup_dead_worker(conn, monkeypatch, *, pid, log_text=None, title="t"):
     return tid
 
 
-def test_billing_wall_clean_exit_not_scored_as_protocol_violation(
+def test_billing_wall_clean_exit_capability_blocked_not_protocol_violation(
     kanban_home, monkeypatch,
 ):
-    """A worker that dies on HTTP 402 with rc=0 must be requeued as
-    rate_limited — NOT recorded as a protocol violation (incident
-    t_543dce5d: 12 consecutive 402s were mis-scored as violations and
-    burned the near-exhausted grant on immediate respawns)."""
+    """A worker that dies on HTTP 402 with rc=0 must be capability-blocked
+    (retries HALTED) — NOT scored as a protocol violation and NOT
+    requeued for paced retries (t_f4c1ddcd / incident t_71e3ba82:
+    5x crash loops burned grant and produced false BEL escalations).
+
+    Prior disposition (t_543dce5d) requeued as rate_limited; the hard
+    credit wall is now a capability halt with a single billing alert.
+    """
     import hermes_cli.kanban_db as _kb
+    import json as _json
 
     with kb.connect() as conn:
         tid = _setup_dead_worker(
@@ -5684,31 +5689,197 @@ def test_billing_wall_clean_exit_not_scored_as_protocol_violation(
         rate_limited = getattr(
             kb.detect_crashed_workers, "_last_rate_limited", []
         )
-        assert tid in rate_limited
+        assert tid not in rate_limited  # hard wall != transient throttle
+        billing = getattr(
+            kb.detect_crashed_workers, "_last_billing_exhausted", []
+        )
+        assert tid in billing
 
         task = kb.get_task(conn, tid)
-        assert task.status == "ready"
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
         assert "billing wall" in (task.last_failure_error or "")
         # No failure counted — the breaker must not see this.
         row = conn.execute(
             "SELECT consecutive_failures FROM tasks WHERE id=?", (tid,)
         ).fetchone()
         assert row["consecutive_failures"] == 0
-        # Run recorded as rate_limited, not crashed.
+        # Run recorded as blocked, not crashed/rate_limited.
         run = conn.execute(
             "SELECT outcome FROM task_runs WHERE task_id=? "
             "ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         if run is not None:
-            assert run["outcome"] in (None, "rate_limited")
-        # Event stream carries the loud error_code.
+            assert run["outcome"] == "blocked"
+        # Event stream carries the loud error_code on billing_exhausted.
         ev = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id=? "
-            "AND kind='rate_limited' ORDER BY id DESC LIMIT 1", (tid,),
+            "AND kind='billing_exhausted' ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert ev is not None
-        import json as _json
         assert _json.loads(ev["payload"])["error_code"] == "billing_exhausted"
+        # Single actionable alert comment.
+        cmt = conn.execute(
+            "SELECT body, author FROM task_comments WHERE task_id=? "
+            "AND body LIKE 'BILLING-EXHAUSTED-ALERT%' LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert cmt is not None
+        assert "portal.nousresearch.com" in cmt["body"]
+        assert cmt["author"] == "kanban-dispatcher"
+        # Alert event present.
+        aev = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? "
+            "AND kind='billing_exhausted_alert' LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert aev is not None
+
+
+def test_billing_wall_404_requires_available_credits_capability_blocked(
+    kanban_home, monkeypatch,
+):
+    """The Nous 404 'requires available credits' signature (t_f4c1ddcd /
+    t_71e3ba82 fleet failure) must classify as billing_exhausted and
+    capability-block — same disposition as HTTP 402."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _setup_dead_worker(
+            conn, monkeypatch, pid=91011,
+            log_text=(
+                "starting worker...\n"
+                "HTTP 404: Model 'anthropic/claude-sonnet-5' requires "
+                "available credits. Your account balance is too low to "
+                "use paid models\n"
+                "Credits 90% used · $22.00 cap / Credit access paused\n"
+            ),
+        )
+        monkeypatch.setattr(
+            _kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0)
+        )
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == []
+        billing = getattr(
+            kb.detect_crashed_workers, "_last_billing_exhausted", []
+        )
+        assert tid in billing
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+        # Not a protocol-violation loop candidate.
+        assert "protocol violation" not in (task.last_failure_error or "")
+
+
+def test_billing_exhausted_alert_emitted_once_on_repeat(
+    kanban_home, monkeypatch,
+):
+    """A second billing-wall death on the same task must NOT spam a second
+    billing alert comment — single actionable alert is the contract."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _setup_dead_worker(
+            conn, monkeypatch, pid=91012,
+            log_text='HTTP 402 "Insufficient available credits"\n',
+        )
+        monkeypatch.setattr(
+            _kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0)
+        )
+        kb.detect_crashed_workers(conn)
+        n1 = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_comments WHERE task_id=? "
+            "AND body LIKE 'BILLING-EXHAUSTED-ALERT%'",
+            (tid,),
+        ).fetchone()["n"]
+        assert n1 == 1
+
+        # Simulate operator (or incorrect monitor) unblocking + respawn,
+        # then death again on the same credit wall.
+        host = _kb._claimer_id().split(":", 1)[0]
+        conn.execute(
+            "UPDATE tasks SET status='running', block_kind=NULL, "
+            "worker_pid=?, claim_lock=?, started_at=? WHERE id=?",
+            (91013, f"{host}:w2", int(time.time()) - 3600, tid),
+        )
+        conn.commit()
+        # Refresh log mtime so it is current evidence.
+        log_path = kb.worker_logs_dir() / f"{tid}.log"
+        log_path.write_text(
+            'HTTP 402 "Insufficient available credits"\n', encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            _kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0)
+        )
+        kb.detect_crashed_workers(conn)
+        n2 = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_comments WHERE task_id=? "
+            "AND body LIKE 'BILLING-EXHAUSTED-ALERT%'",
+            (tid,),
+        ).fetchone()["n"]
+        assert n2 == 1  # still exactly one
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+
+
+def test_billing_wall_does_not_five_x_crash_loop(
+    kanban_home, monkeypatch,
+):
+    """Acceptance: against the t_71e3ba82 failure signature a credit-
+    exhausted model must NOT cause 5x crash loops or false blocked-
+    states-via-breaker. One death → capability-block + alert; another
+    dispatch tick must not respawn it."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _setup_dead_worker(
+            conn, monkeypatch, pid=91014,
+            log_text=(
+                "HTTP 404: Model 'openai/gpt-5.6-sol' requires available "
+                "credits. Your account balance is too low to use paid "
+                "models\n"
+            ),
+            title="p0-security-forward-fix",
+        )
+        monkeypatch.setattr(
+            _kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0)
+        )
+        for _ in range(5):
+            # Each "tick" of detect should leave it blocked after first.
+            kb.detect_crashed_workers(conn)
+            # If it were ready, dispatch would try to run it; simulate
+            # the monitor by only re-running detect while blocked.
+            task = kb.get_task(conn, tid)
+            if task.status == "blocked":
+                break
+            # Force another death cyclic if it somehow returned to ready.
+            host = _kb._claimer_id().split(":", 1)[0]
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=?, started_at=? WHERE id=?",
+                (91014 + _, f"{host}:w{_}", int(time.time()) - 3600, tid),
+            )
+            conn.commit()
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+        row = conn.execute(
+            "SELECT consecutive_failures FROM tasks WHERE id=?", (tid,),
+        ).fetchone()
+        assert row["consecutive_failures"] == 0
+        # check_respawn_guard is irrelevant for blocked; ready-list won't
+        # include it. Prove a dispatch_once dry spawn skip:
+        res = kb.dispatch_once(conn, max_spawn=5, dry_run=True)
+        spawned_ids = [t for (t, *_rest) in res.spawned]
+        assert tid not in spawned_ids
+        # Exactly one billing alert across synthetic multi-tick.
+        n = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_comments WHERE task_id=? "
+            "AND body LIKE 'BILLING-EXHAUSTED-ALERT%'",
+            (tid,),
+        ).fetchone()["n"]
+        assert n == 1
 
 
 def test_unknown_skill_startup_crash_classified_loudly(

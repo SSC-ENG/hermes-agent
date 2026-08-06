@@ -8698,7 +8698,19 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
-    window just makes the task bounce cheaply until the window clears."""
+    window just makes the task bounce cheaply until the window clears.
+
+    Distinct from ``billing_exhausted``: transient throttle vs hard
+    credit/billing wall that needs human top-up or remap."""
+    billing_exhausted: list[str] = field(default_factory=list)
+    """Task ids halted on a hard provider credit wall (HTTP 402 /
+    404-requires-available-credits / Credit access paused).
+
+    Disposition is an immediate ``blocked`` + ``block_kind=capability`` with
+    a single actionable billing alert — retries against the paid model are
+    STOPPED rather than paced. No failure is counted (the task is fine; the
+    account is not). Prevents the rc=0 protocol-violation crash loop that
+    burned grant on fleet retries (t_71e3ba82 / t_f4c1ddcd / t_65e1108c)."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -8760,17 +8772,25 @@ _WORKER_LOG_FAILURE_SIGNATURES: "list[tuple[str, re.Pattern, str]]" = [
     (
         "billing_exhausted",
         re.compile(
+            # Hard credit/billing walls — NOT transient 429 rate limits.
+            # Covers Nous Portal 402 + the 404 "requires available credits"
+            # flavor that crashed the t_71e3ba82 / t_f4c1ddcd fleets.
             r"(?:HTTP[\s_-]*)?\b402\b"
-            r"|insufficient(?:[\s_]available)?[\s_]credits"
+            r"|(?:HTTP[\s_-]*)?\b404\b[^\n]{0,120}requires[\s_]+available[\s_]+credits"
+            r"|requires[\s_]+available[\s_]+credits"
+            r"|insufficient(?:[\s_]available)?[\s_]+credits"
             r"|insufficient_quota"
             r"|exceeded your current quota"
-            r"|billing hard limit",
+            r"|billing hard limit"
+            r"|credit access paused"
+            r"|account balance is too low to use paid models",
             re.IGNORECASE,
         ),
         "provider credits exhausted (billing wall): {match}. "
-        "Requeued without counting a failure — add credits or remap the "
-        "assignee profile to a model with balance; the respawn guard will "
-        "pace retries until then.",
+        "HALTED as capability-block — will NOT retry the paid model. "
+        "HAA action: add credits at https://portal.nousresearch.com "
+        "OR remap the assignee profile/goal-judge to a model with balance, "
+        "then unblock this card.",
     ),
     (
         "unknown_skill",
@@ -8791,6 +8811,140 @@ _WORKER_LOG_FAILURE_SIGNATURES: "list[tuple[str, re.Pattern, str]]" = [
 # failures print within the first/last couple hundred bytes; 8 KiB is a
 # comfortable margin without paging megabytes on every dead-pid check.
 _WORKER_LOG_CLASSIFY_TAIL_BYTES = 8192
+
+
+
+# Marker prefix used to dedupe the single actionable billing alert comment
+# emitted when a worker dies on a hard credit wall. One alert per task —
+# subsequent detections re-block quietly without comment spam.
+_BILLING_EXHAUSTED_ALERT_MARKER = "BILLING-EXHAUSTED-ALERT"
+_BILLING_EXHAUSTED_ALERT_AUTHOR = "kanban-dispatcher"
+_BILLING_PORTAL_URL = "https://portal.nousresearch.com"
+
+
+def _billing_exhausted_alert_body(task_id: str, detail: str) -> str:
+    """Build the single actionable HAA billing alert for a hard credit wall."""
+    clip = (detail or "").strip().replace("\n", " ")
+    if len(clip) > 280:
+        clip = clip[:277] + "..."
+    return (
+        f"{_BILLING_EXHAUSTED_ALERT_MARKER} task={task_id}\n"
+        f"\n"
+        f"Provider credits exhausted (hard billing wall). Retries HALTED.\n"
+        f"\n"
+        f"Evidence: {clip}\n"
+        f"\n"
+        f"HAA action required (no agent holds billing credentials):\n"
+        f"1. Add credits at {_BILLING_PORTAL_URL}, AND/OR\n"
+        f"2. Remap the assignee profile / goal-judge off the paid model\n"
+        f"   to a model with available balance.\n"
+        f"\n"
+        f"This card is blocked (kind=capability). Do NOT respawn until\n"
+        f"credits/remap land — every retry burns the remains of the grant\n"
+        f"and produces false BEL escalations. Unblock manually after action."
+    )
+
+
+def _task_has_billing_alert(conn: "sqlite3.Connection", task_id: str) -> bool:
+    """True when this task already carries the single billing alert comment."""
+    row = conn.execute(
+        "SELECT 1 FROM task_comments WHERE task_id = ? "
+        "AND body LIKE ? LIMIT 1",
+        (task_id, f"{_BILLING_EXHAUSTED_ALERT_MARKER}%"),
+    ).fetchone()
+    return row is not None
+
+
+def _emit_billing_exhausted_alert(
+    conn: "sqlite3.Connection",
+    task_id: str,
+    *,
+    detail: str,
+    run_id: "Optional[int]" = None,
+) -> bool:
+    """Write one durable billing alert comment + event if not already present.
+
+    Returns True when a new alert was emitted, False when deduped.
+    Safe to call outside a write_txn (opens its own). Never raises into the
+    caller — alert emission must not undo an already-recorded capability block.
+    """
+    try:
+        if _task_has_billing_alert(conn, task_id):
+            return False
+        body = _billing_exhausted_alert_body(task_id, detail)
+        # Inline insert (don't nest write_txn via add_comment) when the
+        # caller may already hold a transaction. Detect via sqlite3 status.
+        in_txn = conn.in_transaction
+        if not in_txn:
+            # Own transaction path.
+            with write_txn(conn):
+                if _task_has_billing_alert(conn, task_id):
+                    return False
+                now = int(time.time())
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        _BILLING_EXHAUSTED_ALERT_AUTHOR,
+                        body,
+                        now,
+                    ),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "commented",
+                    {"author": _BILLING_EXHAUSTED_ALERT_AUTHOR, "len": len(body)},
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "billing_exhausted_alert",
+                    {
+                        "error_code": "billing_exhausted",
+                        "portal_url": _BILLING_PORTAL_URL,
+                        "action": "add_credits_or_remap",
+                    },
+                    run_id=run_id,
+                )
+            return True
+        # Already inside a write_txn — insert directly.
+        if _task_has_billing_alert(conn, task_id):
+            return False
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                _BILLING_EXHAUSTED_ALERT_AUTHOR,
+                body,
+                now,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": _BILLING_EXHAUSTED_ALERT_AUTHOR, "len": len(body)},
+            run_id=run_id,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "billing_exhausted_alert",
+            {
+                "error_code": "billing_exhausted",
+                "portal_url": _BILLING_PORTAL_URL,
+                "action": "add_credits_or_remap",
+            },
+            run_id=run_id,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _classify_worker_failure_from_log(
@@ -9534,15 +9688,24 @@ def detect_crashed_workers(
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
-    provider quota wall, NOT a task failure. Such tasks are released back
-    to ``ready`` WITHOUT counting a failure (so a long quota window can't
-    trip the breaker) and stamped with a quota-blocker error so
-    ``check_respawn_guard`` defers their respawn until the window clears.
-    The ids are returned via the ``_last_rate_limited`` function attribute
-    (the public return stays the crashed-only ``list[str]``).
+    *transient* provider quota wall, NOT a task failure. Such tasks are
+    released back to ``ready`` WITHOUT counting a failure (so a long
+    quota window can't trip the breaker) and stamped with a quota-blocker
+    error so ``check_respawn_guard`` defers their respawn until the window
+    clears. The ids are returned via the ``_last_rate_limited`` function
+    attribute (the public return stays the crashed-only ``list[str]``).
+
+    Hard credit exhaustion (HTTP 402 / 404-requires-available-credits /
+    Credit access paused), detected from the worker-log tail as
+    ``billing_exhausted``, is a DIFFERENT disposition: the task is
+    capability-blocked immediately, a single actionable billing alert is
+    emitted, and retries against the paid model STOP. This prevents the
+    crash-loop + false-BEL pattern from t_71e3ba82 / t_f4c1ddcd. Ids land
+    on ``_last_billing_exhausted``.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    billing_exhausted: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -9593,26 +9756,29 @@ def detect_crashed_workers(
             log_error_detail = log_class[1] if log_class else None
             rate_limited_exit = False
             force_block = False
+            billing_exhausted_exit = False
             if log_error_code == "billing_exhausted":
-                # Billing/credit exhaustion is a provider wall, not a task
-                # failure — same disposition as the EX_TEMPFAIL sentinel:
-                # requeue WITHOUT counting a failure so the breaker can't
-                # trip, and stamp a quota-flavored error so
-                # ``check_respawn_guard`` paces retries. This applies even
-                # when the worker exited rc=0 (it never got a model
-                # response, so there was nothing to complete or block).
+                # Hard credit/billing wall (HTTP 402 / 404-requires-available-
+                # credits / Credit access paused). Distinct from transient
+                # EX_TEMPFAIL rate limits: retries against the paid model
+                # burn remaining grant and produce false BEL escalations
+                # (t_71e3ba82 / t_f4c1ddcd / t_65e1108c). HALT immediately
+                # as capability-block — no failure counted, no retry loop.
+                # A single actionable billing alert is emitted below.
                 protocol_violation = False
-                rate_limited_exit = True
+                billing_exhausted_exit = True
                 error_text = (
                     f"pid {pid} died on a provider billing wall — "
                     f"{log_error_detail}"
                 )
-                event_kind = "rate_limited"
+                event_kind = "billing_exhausted"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                     "error_code": "billing_exhausted",
+                    "action": "add_credits_or_remap",
+                    "portal_url": _BILLING_PORTAL_URL,
                 }
             elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -9734,30 +9900,78 @@ def detect_crashed_workers(
                     event_payload["error_code"] = log_error_code
                     event_payload["error_detail"] = log_error_detail
 
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
-            )
+            if billing_exhausted_exit:
+                # Capability-block in-place (no ready→respawn window).
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'blocked', "
+                    "block_kind = 'capability', "
+                    "claim_lock = NULL, claim_expires = NULL, "
+                    "worker_pid = NULL, "
+                    "last_failure_error = ? "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (error_text[:500], row["id"], pid, row["claim_lock"]),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (row["id"], pid, row["claim_lock"]),
+                )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Billing-exhausted is a hard capability halt (blocked).
+                if billing_exhausted_exit:
+                    _run_outcome = "blocked"
+                elif rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
                     error=error_text,
                     metadata=dict(event_payload),
+                    summary=(
+                        error_text[:500] if billing_exhausted_exit else None
+                    ),
                 )
                 _append_event(
                     conn, row["id"], event_kind,
                     event_payload,
                     run_id=run_id,
                 )
-                if rate_limited_exit:
+                if billing_exhausted_exit:
+                    # Single actionable HAA billing alert (deduped per task).
+                    # No failure counter tick — the task is fine, the
+                    # account is not. Retries are halted by the capability
+                    # block above (dispatcher refuses blocked tasks).
+                    _emit_billing_exhausted_alert(
+                        conn,
+                        row["id"],
+                        detail=error_text,
+                        run_id=run_id,
+                    )
+                    # Also emit a standard ``blocked`` event so monitors
+                    # that key on kind='blocked' still see the halt.
+                    _append_event(
+                        conn,
+                        row["id"],
+                        "blocked",
+                        {
+                            "reason": error_text[:500],
+                            "kind": "capability",
+                            "error_code": "billing_exhausted",
+                            "recurrences": 1,
+                        },
+                        run_id=run_id,
+                    )
+                    billing_exhausted.append(row["id"])
+                elif rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
                     # respawn until the window clears — WITHOUT touching
@@ -9900,6 +10114,11 @@ def detect_crashed_workers(
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Hard credit walls halted as capability-blocks (t_f4c1ddcd). Also not
+    # crashes and also not counted against the breaker.
+    detect_crashed_workers._last_billing_exhausted = (  # type: ignore[attr-defined]
+        billing_exhausted
+    )
     return crashed
 
 
@@ -10653,6 +10872,16 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    _crash_billing_exhausted = getattr(
+        detect_crashed_workers, "_last_billing_exhausted", []
+    )
+    if _crash_billing_exhausted:
+        result.billing_exhausted.extend(_crash_billing_exhausted)
+        # Also surface under auto_blocked for monitors that only watch
+        # that bucket — these are hard capability halts, not soft requeues.
+        for _tid in _crash_billing_exhausted:
+            if _tid not in result.auto_blocked:
+                result.auto_blocked.append(_tid)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
