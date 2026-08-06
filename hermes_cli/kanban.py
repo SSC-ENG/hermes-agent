@@ -2677,6 +2677,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, reason) in res.respawn_guarded
             ],
             "rate_limited": res.rate_limited,
+            "billing_exhausted": res.billing_exhausted,
             "skipped_locked": res.skipped_locked,
         }, indent=2))
         return 0
@@ -2720,8 +2721,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(f"Respawn guarded ({reason}): {tid}")
     if res.rate_limited:
         print(
-            f"Rate-limited / billing wall (requeued, no failure counted): "
+            f"Rate-limited / quota wall (requeued, no failure counted): "
             f"{', '.join(res.rate_limited)}"
+        )
+    if res.billing_exhausted:
+        print(
+            f"BILLING EXHAUSTED (capability-blocked, retries HALTED — "
+            f"add credits at https://portal.nousresearch.com or remap model): "
+            f"{', '.join(res.billing_exhausted)}"
         )
     if res.skipped_locked:
         print("Tick skipped: another dispatcher holds the board lock.")
