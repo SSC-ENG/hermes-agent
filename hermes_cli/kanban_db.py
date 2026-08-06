@@ -125,6 +125,20 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+# Bare-block reasons that are queue waits, not human decisions (t_25dd3612).
+_BANDWIDTH_BLOCK_MARKERS = (
+    "no bandwidth",
+    "not enough bandwidth",
+    "worker cap",
+    "no worker",
+)
+# Machine-readable reviewer verdict (engineering-definition-of-done).
+_GATEWAY_VERDICT_RE = re.compile(
+    r"GATEWAY-VERDICT:\s*\S+=\S+\s+head=\S+",
+    re.IGNORECASE,
+)
+# Legacy prose verdict tokens posted by reviewer authorities.
+_LEGACY_VERDICT_RE = re.compile(r"\b(?:PASS|GO|APPROVED)\b", re.IGNORECASE)
 FINDING_DISPOSITIONS = frozenset({
     "accepted_queued",
     "accepted_existing",
@@ -5427,6 +5441,93 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _has_reviewer_verdict(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when ``task_id`` already carries a reviewer verdict.
+
+    Used by the block-source gate (t_25dd3612): a card that already has a
+    posted verdict and is being blocked with a ``review-required`` reason is
+    a *queued dependency*, not a human decision. Scan comment bodies (and
+    event payloads as a secondary surface) for:
+
+    * the canonical ``GATEWAY-VERDICT: <AUTHORITY>=<STATUS> head=<sha>`` marker
+    * legacy prose tokens ``PASS`` / ``GO`` / ``APPROVED``
+    """
+    comments = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    for row in comments:
+        body = row["body"] or ""
+        if _GATEWAY_VERDICT_RE.search(body) or _LEGACY_VERDICT_RE.search(body):
+            return True
+
+    events = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    for row in events:
+        raw = row["payload"]
+        if not raw:
+            continue
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        text = str(raw)
+        if _GATEWAY_VERDICT_RE.search(text) or _LEGACY_VERDICT_RE.search(text):
+            return True
+    return False
+
+
+def _enforce_block_source_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str],
+    kind: Optional[str],
+) -> None:
+    """Reject mislabeled blocks that rot the human-blocked queue.
+
+    Rule A — ``review-required`` reason + posted reviewer verdict:
+    reject ``needs_input`` / ``capability``; require ``dependency`` with a
+    wired parent (``task_links`` incoming edge).
+
+    Rule B — bare block (``kind is None``) with bandwidth / worker-cap
+    language: reject and point the caller at ``--kind dependency``.
+    """
+    reason_text = (reason or "").strip()
+    reason_lower = reason_text.lower()
+
+    # Rule B first — cheap substring check, no DB reads.
+    if kind is None and reason_lower:
+        if any(marker in reason_lower for marker in _BANDWIDTH_BLOCK_MARKERS):
+            raise ValueError(
+                "bandwidth/worker-cap is a dependency wait, not a human block: "
+                "re-run with --kind dependency."
+            )
+
+    # Rule A — review-required + verdict already posted.
+    if reason_lower.startswith("review-required") and _has_reviewer_verdict(
+        conn, task_id
+    ):
+        if kind in ("needs_input", "capability"):
+            raise ValueError(
+                "review-required block with a posted reviewer verdict must use "
+                "--kind dependency with a wired reviewer/merge parent "
+                "(hermes kanban link <lane-task> <id>), not --kind "
+                "needs_input/capability — this is a queued dependency, not a "
+                "human decision."
+            )
+        if kind == "dependency":
+            parents = parent_ids(conn, task_id)
+            if not parents:
+                raise ValueError(
+                    "review-required block with a posted reviewer verdict "
+                    "requires a wired reviewer/merge parent before "
+                    "--kind dependency: run "
+                    "`hermes kanban link <reviewer-or-merge-task> <this-card>` "
+                    "first."
+                )
+
+
 def _most_recent_event_kind(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return the ``kind`` of the single most recent ``task_events`` row for
     ``task_id``, or ``None`` if the task has no events.
@@ -7135,6 +7236,10 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # Forward source gate (t_25dd3612): reject review-required+verdict
+    # mislabeled as human block, and bare bandwidth/worker-cap blocks.
+    # Runs before the write txn so invalid calls leave no partial state.
+    _enforce_block_source_gate(conn, task_id, reason=reason, kind=kind)
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
