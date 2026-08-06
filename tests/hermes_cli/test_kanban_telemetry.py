@@ -173,7 +173,7 @@ def test_scheduled_review_writes_and_persists_both_artifacts(board, tmp_path):
     assert stored["status"] == "COMPLETE"
 
 
-def test_missing_nominal_boundary_emits_critical_review_health_hole(board):
+def test_missed_run_hole_severity(board):
     end = 1_800_000_000
     with kb.connect_closing() as conn:
         conn.execute(
@@ -539,3 +539,78 @@ def test_persist_review_replay_updates_observation_fields_without_row_identity_l
         # Observation fields advanced monotonically on the SAME row.
         assert row["state"] == "PERSISTING"
         assert row["last_observed_at"] >= row["first_observed_at"]
+
+# ---------------------------------------------------------------------------
+# HEL-3113 follow-up: per-board corrupt-DB isolation
+# ---------------------------------------------------------------------------
+
+def test_scheduled_reviews_isolate_corrupt_sibling_board(board, tmp_path, caplog):
+    """A corrupt board must not abort the review cycle for a healthy sibling.
+
+    Two-board fixture: default is healthy, broken has an on-disk kanban.db
+    that is not a valid SQLite file. The healthy board's review artifact
+    must still be written and persisted; the corrupt board must be skipped
+    without a full traceback in the logs.
+    """
+    import logging
+
+    kb.create_board("broken")
+    broken_db_path = kb.kanban_db_path(board="broken")
+    broken_db_path.parent.mkdir(parents=True, exist_ok=True)
+    broken_db_path.write_bytes(b"not a sqlite database at all")
+    kb._INITIALIZED_PATHS.discard(str(broken_db_path.resolve()))
+
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="scheduled", triage=True)
+
+    end = 1_800_000_000
+    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_telemetry"):
+        results = telemetry.run_scheduled_reviews(now=end)
+
+    slugs = {slug for slug, *_ in results}
+    assert "default" in slugs
+    assert "broken" not in slugs
+
+    default_result = next(r for r in results if r[0] == "default")
+    _, default_report, default_json, default_md = default_result
+    assert default_json.is_file()
+    assert default_md.is_file()
+    with kb.connect_closing(board="default") as conn:
+        stored = conn.execute(
+            "SELECT status FROM telemetry_review_runs WHERE review_id = ?",
+            (default_report["review"]["review_id"],),
+        ).fetchone()
+    assert stored["status"] == "COMPLETE"
+
+    # No full traceback for the classified-corrupt board.
+    for record in caplog.records:
+        if record.exc_info is not None:
+            assert "broken" not in record.getMessage(), (
+                "corrupt board must not log a traceback"
+            )
+    assert any(
+        record.levelno == logging.ERROR and "broken" in record.getMessage()
+        for record in caplog.records
+    ), "expected a single classified error line for the corrupt board"
+
+
+def test_scheduled_reviews_skip_slugs_bypasses_open_attempt(board, monkeypatch):
+    """Boards already quarantined by dispatch are skipped without a connect."""
+    kb.create_board("quarantined")
+
+    attempted: list[str] = []
+    original = telemetry.run_scheduled_review
+
+    def _spy(*, board_slug, **kwargs):
+        attempted.append(board_slug)
+        return original(board_slug=board_slug, **kwargs)
+
+    monkeypatch.setattr(telemetry, "run_scheduled_review", _spy)
+
+    results = telemetry.run_scheduled_reviews(
+        now=1_800_000_000, skip_slugs={"quarantined"},
+    )
+
+    assert "quarantined" not in attempted
+    assert "default" in attempted
+    assert all(slug != "quarantined" for slug, *_ in results)
