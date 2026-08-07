@@ -5786,6 +5786,31 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
+                    # HAA ruling 2026-08-04 (burn incident): the
+                    # consecutive_failures counter above only moves on
+                    # FAILED exits.  A task that exits 'completed' or
+                    # 'blocked' each cycle keeps failures == 0 forever,
+                    # so the breaker never trips and the documented
+                    # block -> auto-recover -> respawn loop runs
+                    # unbounded.  Observed: single cards at 174/138/127
+                    # runs, ~206 billable sessions/hour, ~$98/hr burn.
+                    #
+                    # Bound total respawns per task regardless of exit
+                    # status: count real spawn attempts (task_runs).
+                    respawn_cap = max(int(effective_limit) * 10, 20)
+                    total_runs = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+                            (task_id,),
+                        ).fetchone()[0]
+                        or 0
+                    )
+                    if total_runs >= respawn_cap:
+                        _append_event(conn, task_id, "respawn_cap_reached", {
+                            "total_runs": total_runs,
+                            "respawn_cap": respawn_cap,
+                        })
+                        continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' "
                         "WHERE id = ? AND status = 'blocked'",

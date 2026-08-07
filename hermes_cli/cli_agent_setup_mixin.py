@@ -357,6 +357,20 @@ class CLIAgentSetupMixin:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            # HAA ruling 2026-08-04 (binding): monitors never exceed the
+            # nemotron ceiling, and no agent may run an undefined model.
+            # This is the single spawn choke point — enforce here so every
+            # path (kanban, cron, CLI, gateway) is covered.
+            try:
+                from hermes_cli.model_policy import enforce as _enforce_model
+
+                effective_model = _enforce_model(
+                    getattr(self, "profile", None)
+                    or getattr(self, "profile_name", None),
+                    effective_model,
+                )
+            except ImportError:
+                pass
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
