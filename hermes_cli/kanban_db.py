@@ -6459,8 +6459,148 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class MissingDispositionError(ValueError):
+    """Raised when a BEL-ESCALATION / BEL-MISSED-HANDOFF is completed
+    without a required disposition tag.
+
+    Allowed tags: ``TRUE_BLOCK``, ``LINKED_FIX_PENDING``, ``UNBLOCKED``.
+    Supply via ``metadata[\"disposition\"]`` or free-text in summary/result.
+    Task state is NOT mutated; callers may retry with a corrected handoff.
+    """
+
+    ALLOWED = ("TRUE_BLOCK", "LINKED_FIX_PENDING", "UNBLOCKED")
+
+    def __init__(self, completing_task_id: str, title: str = ""):
+        self.completing_task_id = completing_task_id
+        self.title = title or ""
+        super().__init__(
+            f"completion blocked: BEL card {completing_task_id} requires a "
+            f"disposition tag in --summary/--result or "
+            f"--metadata '{{\"disposition\": \"...\"}}'. "
+            f"Allowed: {', '.join(self.ALLOWED)}"
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+# BEL closed-loop disposition tags (blocked-column monitor / t_0cef6b6e).
+BEL_DISPOSITION_TRUE_BLOCK = "TRUE_BLOCK"
+BEL_DISPOSITION_LINKED_FIX = "LINKED_FIX_PENDING"
+BEL_DISPOSITION_UNBLOCKED = "UNBLOCKED"
+BEL_VALID_DISPOSITIONS = (
+    BEL_DISPOSITION_TRUE_BLOCK,
+    BEL_DISPOSITION_LINKED_FIX,
+    BEL_DISPOSITION_UNBLOCKED,
+)
+_BEL_TITLE_PREFIXES = ("BEL-ESCALATION", "BEL-MISSED-HANDOFF")
+_BEL_DISPOSITION_PATTERNS = {
+    BEL_DISPOSITION_TRUE_BLOCK: re.compile(r"\bTRUE[\s_-]*BLOCK\b", re.IGNORECASE),
+    BEL_DISPOSITION_LINKED_FIX: re.compile(
+        r"\bLINKED[\s_-]*FIX[\s_-]*PENDING\b", re.IGNORECASE
+    ),
+    BEL_DISPOSITION_UNBLOCKED: re.compile(
+        r"\b(?:ALREADY[\s_-]*)?UNBLOCKED\b", re.IGNORECASE
+    ),
+}
+
+
+def is_bel_disposition_card(title: Optional[str]) -> bool:
+    """True when *title* is a blocked-escalation-loop card that requires a tag."""
+    t = (title or "").strip()
+    return any(t.startswith(p) for p in _BEL_TITLE_PREFIXES)
+
+
+def extract_bel_disposition(
+    *texts: Optional[str],
+    metadata: Any = None,
+) -> Optional[str]:
+    """Return the first recognized BEL disposition tag, or None.
+
+    Precedence: ``metadata['disposition']`` (normalized) then prose scan of
+    the supplied texts. ``TRUE_BLOCK`` outranks softer tags when both appear.
+    """
+    if isinstance(metadata, str) and metadata.strip():
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = None
+    if isinstance(metadata, dict):
+        raw = metadata.get("disposition")
+        if raw is None:
+            raw = metadata.get("Disposition")
+        if raw is not None:
+            tag = _normalize_bel_disposition_token(str(raw))
+            if tag:
+                return tag
+    blob = "\n".join(t for t in texts if t)
+    if not blob:
+        return None
+    for tag in BEL_VALID_DISPOSITIONS:
+        if _BEL_DISPOSITION_PATTERNS[tag].search(blob):
+            return tag
+    return None
+
+
+def _normalize_bel_disposition_token(raw: str) -> Optional[str]:
+    s = raw.strip().upper().replace("-", "_").replace(" ", "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    if "TRUE_BLOCK" in s or s.replace("_", "") == "TRUEBLOCK":
+        return BEL_DISPOSITION_TRUE_BLOCK
+    if "LINKED_FIX" in s:
+        return BEL_DISPOSITION_LINKED_FIX
+    if "UNBLOCK" in s:
+        return BEL_DISPOSITION_UNBLOCKED
+    if s in BEL_VALID_DISPOSITIONS:
+        return s
+    return None
+
+
+def _require_bel_disposition_or_raise(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+    metadata: Optional[dict],
+) -> Optional[str]:
+    """Gate BEL card completion on a disposition tag.
+
+    Returns the resolved tag when present (caller may stamp it onto metadata).
+    Raises :class:`MissingDispositionError` when missing. Emits an auditable
+    ``completion_blocked_disposition`` event before raising. Does not mutate
+    task status.
+    """
+    row = conn.execute(
+        "SELECT title FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    title = row["title"] if row else ""
+    if not is_bel_disposition_card(title):
+        return None
+    tag = extract_bel_disposition(summary, result, metadata=metadata)
+    if tag:
+        return tag
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "completion_blocked_disposition",
+            {
+                "schema_version": 1,
+                "reason": "bel_disposition_required",
+                "allowed": list(BEL_VALID_DISPOSITIONS),
+                "title_preview": (title or "")[:160],
+                "summary_preview": (
+                    (summary or result or "").strip().splitlines()[0][:200]
+                    if (summary or result)
+                    else None
+                ),
+            },
+        )
+    raise MissingDispositionError(task_id, title=title or "")
 
 
 def complete_task(
@@ -6495,6 +6635,12 @@ def complete_task(
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
 
+    BEL-ESCALATION / BEL-MISSED-HANDOFF cards additionally require a
+    disposition tag (``TRUE_BLOCK`` | ``LINKED_FIX_PENDING`` | ``UNBLOCKED``)
+    in summary/result prose or ``metadata[\"disposition\"]``. Missing tags
+    raise :class:`MissingDispositionError` without mutating task state
+    (closed-loop autonomy substrate / t_0cef6b6e).
+
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
     Any suspected phantom references are recorded as a
@@ -6524,6 +6670,22 @@ def complete_task(
                     },
                 )
             return False
+
+    # BEL closed-loop gate: managers must tag disposition on escalation close
+    # so the reconciliation pass can distinguish TRUE_BLOCK from a fix that
+    # never landed. Shared DB writer — CLI/tools/dashboard cannot bypass.
+    bel_disposition = _require_bel_disposition_or_raise(
+        conn,
+        task_id,
+        summary=summary,
+        result=result,
+        metadata=metadata if isinstance(metadata, dict) else None,
+    )
+    if bel_disposition:
+        if metadata is None:
+            metadata = {"disposition": bel_disposition}
+        elif isinstance(metadata, dict) and "disposition" not in metadata:
+            metadata = {**metadata, "disposition": bel_disposition}
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
