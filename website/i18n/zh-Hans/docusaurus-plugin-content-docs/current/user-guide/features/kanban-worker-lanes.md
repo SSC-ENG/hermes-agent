@@ -7,7 +7,7 @@
 - **运维人员**：选择将哪些通道接入看板（创建哪些 profile，使用哪些 assignee）。
 - **插件/集成作者**：希望添加新的通道形态（封装 Codex / Claude Code / OpenCode 的 CLI worker、容器化审查 worker、通过 API 拉取任务的非 Hermes 服务）。
 
-如果你编写的是 worker 代码本身——即运行在通道*内部*的 agent——kanban 生命周期与参考细节会自动注入到 worker 的系统提示中（[`agent/prompt_builder.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/prompt_builder.py) 中的 `KANBAN_GUIDANCE` 块）。
+如果你编写的是 worker 代码本身——即运行在通道*内部*的 agent——kanban 生命周期与参考细节会自动注入到 worker 的系统提示中（[`agent/prompt_builder.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/prompt_builder.py) 中的 `KANBAN_GUIDANCE` 块）。该块还引导上下文成本纪律：会话开始时做一次定向 `kanban_show()`，对其它卡片使用 `kanban_show(task_id=...)` 定向读取而不是反复全板 dump，并对大文件优先使用 `read_file` 的 `offset`/`limit` 范围读取。
 
 ## 层级结构
 

@@ -7,7 +7,7 @@ This page is the contract. It exists for two audiences:
 - **Operators** picking which lanes to wire into a board (which profiles to create, which assignees to use).
 - **Plugin / integration authors** wanting to add a new lane shape (a CLI worker that wraps Codex / Claude Code / OpenCode, a containerised review worker, a non-Hermes service that pulls tasks via the API).
 
-If you're writing the worker code itself — the agent that runs *inside* a lane — the kanban lifecycle and reference details are injected into the worker's system prompt automatically (the `KANBAN_GUIDANCE` block in [`agent/prompt_builder.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/prompt_builder.py)).
+If you're writing the worker code itself — the agent that runs *inside* a lane — the kanban lifecycle and reference details are injected into the worker's system prompt automatically (the `KANBAN_GUIDANCE` block in [`agent/prompt_builder.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/prompt_builder.py)). That block also steers context-cost discipline: one orienting `kanban_show()` at session start, targeted `kanban_show(task_id=...)` for other cards instead of repeated full-board dumps, and `read_file` `offset`/`limit` ranged reads over full-file reads.
 
 ## The hierarchy
 
