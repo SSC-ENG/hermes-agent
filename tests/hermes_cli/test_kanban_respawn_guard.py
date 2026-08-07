@@ -21,6 +21,17 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture(autouse=True)
+def _pr_state_open(monkeypatch):
+    """This file exercises the guard's comment-timestamp / requeue-bypass
+    logic, not live PR-state resolution (that's covered separately in
+    test_kanban_db.py's ``_resolve_pr_open_state`` tests). Force every
+    cited PR to resolve as OPEN so these tests keep isolating the ordering
+    logic instead of depending on the real (and mutable) state of the
+    fixture PR URL on GitHub."""
+    monkeypatch.setattr(kb, "_resolve_pr_open_state", lambda o, r, n: True)
+
+
 def _make_code_task(conn, task_id: str) -> None:
     """Mark the task as a code/PR-producing task (branch_name set).
 
@@ -123,6 +134,41 @@ def test_respawn_guard_active_pr_not_bypassed_by_same_timestamp_requeue(
             "VALUES (?, 'promoted', ?)",
             (task_id, created_at),
         )
+
+        reason = kb.check_respawn_guard(conn, task_id)
+
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_merged_pr_does_not_hold_even_without_requeue(
+    kanban_home, monkeypatch,
+):
+    """State-awareness (t_edd7abd5): a merged/closed PR must not hold the
+    guard even with zero requeue events — this is the exact production
+    failure (PRs #888/#889/#890/#895/#898 already merged, cited in
+    comments, held the card for the full window with no requeue in sight).
+    The requeue-bypass tested above is a SEPARATE, ADDITIONAL escape hatch
+    on top of state-awareness, not a substitute for it."""
+    monkeypatch.setattr(kb, "_resolve_pr_open_state", lambda o, r, n: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="merged-pr-no-requeue", assignee="alice")
+        _make_code_task(conn, task_id)
+        _add_pr_comment(conn, task_id, int(time.time()) - 10)
+
+        reason = kb.check_respawn_guard(conn, task_id)
+
+    assert reason is None
+
+
+def test_respawn_guard_unresolvable_pr_state_still_holds(kanban_home, monkeypatch):
+    """When PR state can't be resolved live, the guard preserves the old
+    conservative (text-only) behavior — unknown state still holds, never
+    silently permits a respawn that might duplicate a genuinely open PR."""
+    monkeypatch.setattr(kb, "_resolve_pr_open_state", lambda o, r, n: None)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="unresolvable-pr", assignee="alice")
+        _make_code_task(conn, task_id)
+        _add_pr_comment(conn, task_id, int(time.time()) - 10)
 
         reason = kb.check_respawn_guard(conn, task_id)
 
