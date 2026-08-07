@@ -1477,10 +1477,13 @@ KANBAN_SHOW_SCHEMA = {
     "description": (
         "Read a task's full state — title, body, assignee, parent task "
         "handoffs, your prior attempts on this task if any, comments, "
-        "and recent events. Use this to (re)orient yourself before "
-        "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "and recent events. Call once at session start to orient "
+        "(defaults to your assigned task). To check another card, pass "
+        "``task_id=...`` for a targeted read — do not repeatedly re-show "
+        "the same task unless you created or blocked a card since the "
+        "last snapshot. The response includes a pre-formatted "
+        "``worker_context`` string suitable for inclusion verbatim in "
+        "your reasoning."
     ),
     "parameters": {
         "type": "object",
