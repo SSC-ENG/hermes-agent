@@ -507,7 +507,7 @@ def load_cli_config() -> Dict[str, Any]:
             "show_reasoning": True,
             "reasoning_full": False,
             "streaming": True,
-            "busy_input_mode": "interrupt",
+            "busy_input_mode": "steer",
             "persistent_output": True,
             "persistent_output_max_lines": 200,
             # Print a one-line summary of resolved modal prompts (approval /
@@ -4267,16 +4267,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             enabled=CLI_CONFIG["display"].get("persistent_output", True),
             max_lines=CLI_CONFIG["display"].get("persistent_output_max_lines", 200),
         )
-        # busy_input_mode: "interrupt" (Enter redirects current run),
-        # "queue" (Enter queues for next turn), or "steer" (Enter injects
-        # mid-run via /steer, arriving after the next tool call).
-        _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "interrupt")).strip().lower()
+        # busy_input_mode: "steer" (DEFAULT — Enter injects mid-run via
+        # /steer, redirecting the live turn), "queue" (Enter queues for the
+        # next turn), or "interrupt" (Enter halts and redirects the run).
+        # Steering is the default so mid-turn input corrects work in flight;
+        # in the desktop composer Cmd/Ctrl+Enter is the explicit queue opt-in.
+        _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "steer")).strip().lower()
         if _bim == "queue":
             self.busy_input_mode = "queue"
-        elif _bim == "steer":
-            self.busy_input_mode = "steer"
-        else:
+        elif _bim == "interrupt":
             self.busy_input_mode = "interrupt"
+        else:
+            self.busy_input_mode = "steer"
 
         # self.verbose ONLY controls global DEBUG logging (root logger level).
         # display.tool_progress="verbose" controls tool-call rendering (full args,

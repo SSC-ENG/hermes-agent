@@ -459,7 +459,9 @@ def _load_busy_input_mode() -> str:
     if not isinstance(display, dict):
         display = {}
     raw = str(display.get("busy_input_mode", "") or "").strip().lower()
-    return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
+    # Steering is the default (see config_defaults / cli.py): unset or
+    # unrecognized values steer rather than interrupt.
+    return raw if raw in {"queue", "steer", "interrupt"} else "steer"
 
 
 def _load_interim_assistant_messages() -> bool:

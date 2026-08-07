@@ -994,7 +994,11 @@ DEFAULT_CONFIG = {
         # when an exchange was tool-heavy. Set False to restore the legacy
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
-        "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # Steering is the default: mid-turn input redirects the LIVE turn
+        # rather than interrupting it or waiting behind a queue. In the
+        # desktop composer plain Enter steers; Cmd/Ctrl+Enter is the explicit
+        # opt-in to QUEUE a follow-up instead (see apps/desktop chat composer).
+        "busy_input_mode": "steer",  # interrupt | queue | steer
         # When busy_input_mode="steer", suppress only the visible
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.
