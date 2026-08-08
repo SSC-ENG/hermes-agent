@@ -142,7 +142,7 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     # Hit the gate first.
     rejected = json.loads(kt._handle_complete({
         "summary": "oops",
-        "created_cards": ["t_phantomdeadbeef"],
+        "created_cards": ["t_deadbeefdead"],
     }))
     assert rejected.get("error")
 
