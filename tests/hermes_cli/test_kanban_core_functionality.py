@@ -1146,7 +1146,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
             kb.complete_task(
                 conn, parent_a,
                 summary="oops",
-                created_cards=["t_phantomdeadbeef"],
+                created_cards=["t_deadbeefdead"],
             )
         assert kb.get_task(conn, parent_a).status == "running"
 
@@ -1165,7 +1165,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
             kb.complete_task(
                 conn, parent_b,
                 summary="oops",
-                created_cards=[real, "t_anotherphantom"],
+                created_cards=[real, "t_cafebabef00d"],
             )
         assert kb.get_task(conn, parent_b).status == "running"
 
@@ -1188,6 +1188,74 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
             ]
             assert kinds.count("completion_blocked_hallucination") == 1
             assert kinds.count("completed") == 1
+    finally:
+        conn.close()
+
+
+def test_complete_ignores_external_tracker_keys_in_created_cards(kanban_home):
+    """Linear/Asana/etc. keys are not kanban task ids.
+
+    Workers often pass HEL-#### (or similar) in created_cards as
+    evidence of tickets they filed. Those strings are not rows in
+    ``tasks`` and must not trip completion_blocked_hallucination.
+    Regression for the t_850bdb1c false positive (HEL Linear keys
+    treated as phantom kanban cards).
+    """
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="external-refs", assignee="alice")
+        kb.claim_task(conn, parent)
+        real = kb.create_task(
+            conn, title="real-child", assignee="x", created_by="alice",
+        )
+
+        # External keys alone must complete (gate sees zero kanban claims).
+        ok = kb.complete_task(
+            conn, parent,
+            summary="filed Linear tickets",
+            created_cards=[
+                "HEL-4032", "HEL-4033", "HEL-4034",
+                "HEL-4035", "HEL-4036", "HEL-4037",
+            ],
+        )
+        assert ok is True
+        assert kb.get_task(conn, parent).status == "done"
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (parent,),
+            )
+        ]
+        assert "completion_blocked_hallucination" not in kinds
+        assert kinds.count("completed") == 1
+
+        # Mixed: real kanban child + external keys → complete; external
+        # keys never appear in a phantom list.
+        parent2 = kb.create_task(conn, title="mixed-refs", assignee="alice")
+        kb.claim_task(conn, parent2)
+        ok = kb.complete_task(
+            conn, parent2,
+            summary="child + Linear",
+            created_cards=[real, "HEL-4032", "NEX-99", "not-a-card"],
+        )
+        assert ok is True
+        assert kb.get_task(conn, parent2).status == "done"
+
+        # Mixed: phantom kanban id + external keys → still reject, but
+        # only the t_* phantom is reported.
+        parent3 = kb.create_task(conn, title="phantom-mix", assignee="alice")
+        kb.claim_task(conn, parent3)
+        with pytest.raises(kb.HallucinatedCardsError) as ei:
+            kb.complete_task(
+                conn, parent3,
+                summary="oops",
+                created_cards=["t_deadbeefdead", "HEL-4032", "ASANA-123"],
+            )
+        phantoms = list(ei.value.phantom)
+        assert "t_deadbeefdead" in phantoms
+        assert "HEL-4032" not in phantoms
+        assert "ASANA-123" not in phantoms
+        assert kb.get_task(conn, parent3).status == "running"
     finally:
         conn.close()
 

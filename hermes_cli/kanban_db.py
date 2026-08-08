@@ -6327,6 +6327,14 @@ def reassign_task(
         return False
 
 
+# Kanban task primary keys only. External tracker keys (Linear HEL-1234,
+# Asana GIDs, GitHub issues, …) are NOT rows in ``tasks`` and must never
+# enter the hallucination gate — workers routinely list them in
+# ``created_cards`` as work-item evidence and a namespace mismatch was
+# raising completion_blocked_hallucination on legitimate completions.
+_KANBAN_TASK_ID_RE = re.compile(r"^t_[a-f0-9]{8,}$")
+
+
 def _verify_created_cards(
     conn: sqlite3.Connection,
     completing_task_id: str,
@@ -6334,8 +6342,12 @@ def _verify_created_cards(
 ) -> tuple[list[str], list[str]]:
     """Partition ``claimed_ids`` into (verified, phantom).
 
-    A card is "verified" iff a row exists in ``tasks`` AND at least one
-    of the following holds:
+    Only kanban task ids (``t_<hex>``) participate. Non-kanban claims
+    (Linear ``HEL-…``, other tracker keys, free text) are ignored —
+    they are not phantom cards and must not block completion.
+
+    A kanban card is "verified" iff a row exists in ``tasks`` AND at
+    least one of the following holds:
 
     * ``created_by`` matches the completing task's ``assignee`` profile
       (the common case: worker A spawns a card via ``kanban_create``,
@@ -6348,20 +6360,26 @@ def _verify_created_cards(
       the dashboard/CLI by a different principal but then attached to
       the completing task by the worker.
 
-    ``phantom`` returns ids that either don't exist at all, or exist
-    but don't satisfy any of the three trust conditions. The caller
-    decides what to do with each bucket; this helper never mutates.
+    ``phantom`` returns kanban-shaped ids that either don't exist at
+    all, or exist but don't satisfy any of the three trust conditions.
+    The caller decides what to do with each bucket; this helper never
+    mutates.
     """
     claimed = [str(x).strip() for x in (claimed_ids or []) if str(x).strip()]
     if not claimed:
         return [], []
-    # Dedupe while preserving order.
+    # Dedupe while preserving order; drop non-kanban ids up front so
+    # external tracker keys never land in either bucket.
     seen: set[str] = set()
     ordered: list[str] = []
     for cid in claimed:
-        if cid not in seen:
-            seen.add(cid)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if _KANBAN_TASK_ID_RE.fullmatch(cid):
             ordered.append(cid)
+    if not ordered:
+        return [], []
 
     row = conn.execute(
         "SELECT assignee FROM tasks WHERE id = ?", (completing_task_id,),
